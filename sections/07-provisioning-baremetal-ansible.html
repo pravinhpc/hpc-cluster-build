@@ -1,0 +1,428 @@
+<!DOCTYPE html>
+<html data-theme="dark" lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Roll-Your-Own: Bare-Metal Provisioning with Ansible + Slurm | HPC Cluster Build Guide</title>
+<link rel="stylesheet" href="../assets/css/style.css">
+</head>
+<body>
+<header class="top"><div class="wrap"><a href="../index.html">HPC Cluster Build Guide</a><span class="badge">Public Edition</span></div></header>
+<div class="wrap"><nav class="crumbs"><a href="06-provisioning-warewulf-openhpc.html">← Warewulf + OpenHPC</a></nav>
+<main>
+
+<h1>07 — Roll-Your-Own: Bare-Metal Provisioning with Ansible + Slurm (No Vendor CM Tool)</h1>
+<p class="lede">Every HPC cluster manager we've covered so far — Bright Cluster Manager, xCAT, Warewulf — bundles provisioning, image management, and monitoring into one opinionated product. Plenty of teams skip all of them and build the same outcome from plain, boring, well-documented pieces: a kickstart file, an Ansible inventory, and a pile of roles. This section walks through why teams do that, what the toolchain looks like, and a realistic step-by-step build.</p>
+
+<h2>Why skip the vendor cluster-management tool?</h2>
+<p>Bright Cluster Manager (BCM), xCAT, and Warewulf all solve a real problem — turning a rack of bare-metal servers into a coherent, provisioned, monitored cluster — but they come with trade-offs that push some teams toward a hand-rolled stack instead:</p>
+<div class="grid2">
+<div class="card">
+<h3>Reasons to go vendor/CM-tool</h3>
+<ul>
+<li>Turnkey image management, node groups, health checks, GUI/CLI out of the box</li>
+<li>Vendor support contract (BCM) — someone to call at 2am</li>
+<li>Built-in monitoring/alerting integration</li>
+<li>Faster to stand up a first cluster if the team has never done this before</li>
+</ul>
+</div>
+<div class="card">
+<h3>Reasons to roll your own</h3>
+<ul>
+<li><strong>Small clusters</strong> (a handful to a few dozen nodes) where a full CM platform is overkill</li>
+<li><strong>Full control</strong> — no black-box image format, no proprietary CLI wrapping systemd/Slurm underneath</li>
+<li><strong>Avoiding vendor lock-in</strong> — BCM licensing cost scales with node count; Ansible/Foreman are free and portable</li>
+<li><strong>Cloud/bare-metal hybrid</strong> — the same Ansible roles that configure a bare-metal compute node can configure a cloud VM or a bare-metal-as-a-service instance (Oracle Cloud, CoreWeave, Equinix Metal), so one config-management codebase spans both</li>
+<li><strong>Existing Ansible investment</strong> — many infra teams already run Ansible for everything else (networking, storage, web fleets); adding Slurm nodes to the same tool avoids a second stack to learn</li>
+<li><strong>Auditability</strong> — plain YAML in git is easier to diff, review, and reason about than a CM tool's internal database</li>
+</ul>
+</div>
+</div>
+<div class="callout warn"><div class="label">The honest trade-off</div>Full control and zero license cost, but you own every integration and edge case: driver version skew, kernel/OFED mismatches, image drift, and the glue between provisioning and the scheduler are now your team's job, not a vendor's. Roll-your-own works best when you have (or want to build) real Ansible/Linux systems expertise on the team.</div>
+
+<h2>The toolchain</h2>
+<p>There's no single "roll-your-own" product — it's a stack of small, independently maintained tools, each doing one job well:</p>
+<table>
+<thead><tr><th>Layer</th><th>Tool options</th><th>Job</th></tr></thead>
+<tbody>
+<tr><td>Bare-metal OS install</td><td>Foreman + Cobbler, or Canonical MAAS, or plain PXE + kickstart/preseed</td><td>PXE-boot a bare node, partition disks, install a minimal base OS unattended</td></tr>
+<tr><td>Golden image (optional)</td><td>HashiCorp Packer</td><td>Pre-bake an OS image with drivers/agents already installed, so first boot is fast and consistent</td></tr>
+<tr><td>Configuration management</td><td>Ansible (playbooks + roles)</td><td>Bring every node to a known-good state: users, NTP, DNS, drivers, packages, services</td></tr>
+<tr><td>Cluster software</td><td>Ansible roles for Slurm, munge, OpenMPI, MLNX_OFED / GPU drivers</td><td>Turn a configured Linux box into a working scheduler node</td></tr>
+<tr><td>Testing / CI</td><td>ansible-lint, Molecule, git + GitLab CI/GitHub Actions</td><td>Catch broken roles before they hit production nodes</td></tr>
+</tbody>
+</table>
+<p>A common, pragmatic pattern for teams under ~200 nodes: skip Foreman/Cobbler entirely, use a plain PXE server (dnsmasq + a kickstart file per node role) to get a minimal OS on the disk, then hand everything else — from that point forward — to Ansible. Foreman or MAAS earn their keep once you're managing enough hardware diversity or churn that a UI-driven inventory of machines, discovery, and re-provisioning workflows pays for itself.</p>
+
+<h2>Step-by-step: building the pipeline</h2>
+
+<div class="card">
+<h3>Step 1 — PXE / kickstart base OS install</h3>
+<p>Every node PXE-boots off the management network, hits a DHCP/TFTP server (dnsmasq is the common lightweight choice; Foreman/Cobbler if you want a managed front-end), and loads a kickstart (RHEL/Rocky/AlmaLinux) or preseed/cloud-init (Debian/Ubuntu) file that does the minimum: partition disks, set the hostname from MAC/IP mapping, install a minimal package set, drop an SSH key, and register the node so Ansible can reach it. Nothing cluster-specific happens here — no drivers, no Slurm. That's Ansible's job, starting the moment the node reboots into its installed OS.</p>
+<pre><code># /var/lib/tftpboot/kickstart/compute.ks  (RHEL/Rocky-family)
+lang en_US.UTF-8
+keyboard us
+timezone UTC --utc
+rootpw --lock
+sshkey --username=root "ssh-ed25519 AAAA...clusteradmin"
+
+# Minimal, deterministic partitioning — no LVM surprises
+zerombr
+clearpart --all --initlabel
+part /boot --fstype=xfs --size=1024
+part swap --size=8192
+part / --fstype=xfs --size=1 --grow
+
+# Register in Cobbler/Foreman or just enroll into Ansible inventory
+%post --log=/root/ks-post.log
+useradd -m -G wheel clusteradmin
+echo "clusteradmin ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/clusteradmin
+curl -fsSL http://mgmt01/bootstrap/enroll.sh | bash -s -- "$(hostname)"
+%end
+
+reboot
+</code></pre>
+<p>If you want faster, more consistent installs at scale, use <strong>Packer</strong> to build a golden image (disk image or container-style rootfs) with the base packages, agents, and even MLNX_OFED pre-baked, so kickstart just lays the image down instead of running a full package install every time. This is the closest roll-your-own gets to Warewulf's stateless-image model, but entirely optional — most small clusters skip it and just run kickstart + Ansible fresh each time.</p>
+</div>
+
+<div class="card">
+<h3>Step 2 — Inventory design (group nodes by role)</h3>
+<p>Ansible's inventory is the map of the cluster: which hosts exist, and which groups (login/compute/storage/controller) they belong to. Group-based variables are how you say "all compute nodes get GPU drivers" or "only the controller gets slurmctld" without repeating yourself per host.</p>
+<pre><code># inventory/production/hosts.yml
+all:
+  children:
+    slurm_controller:
+      hosts:
+        ctrl01.cluster.local:
+    slurm_login:
+      hosts:
+        login01.cluster.local:
+        login02.cluster.local:
+    slurm_compute:
+      hosts:
+        gpu[001:032].cluster.local:
+      vars:
+        has_gpu: true
+        ib_hca: mlx5_0
+    storage:
+      hosts:
+        nfs01.cluster.local:
+        nfs02.cluster.local:
+    cluster:
+      children:
+        slurm_controller:
+        slurm_login:
+        slurm_compute:
+        storage:
+      vars:
+        munge_key_path: /etc/munge/munge.key
+        slurm_cluster_name: rndcluster
+        ntp_servers: [ntp01.cluster.local]
+        domain: cluster.local
+</code></pre>
+<p>Keep host ranges (<code>gpu[001:032]</code>) rather than 32 individual lines — it's the difference between an inventory you can review in a code review and one nobody reads. Split into <code>inventory/production</code> and <code>inventory/staging</code> directories so a small test rack can validate role changes before they touch the real fleet.</p>
+</div>
+
+<div class="card">
+<h3>Step 3 — Common roles: NTP, DNS, users, drivers</h3>
+<p>Every node, regardless of role, needs the same baseline: time sync (Slurm and munge are both sensitive to clock skew), consistent DNS/hosts resolution, the same admin users and SSH keys, and — for GPU/IB nodes — the NVIDIA driver and MLNX_OFED (or DOCA-OFED, its successor) InfiniBand/RoCE stack. This is where a roll-your-own stack does the work BCM/Warewulf would otherwise do for you via their image/driver management.</p>
+<pre><code># roles/common/tasks/main.yml
+- name: Install baseline packages
+  ansible.builtin.package:
+    name: [chrony, tuned, vim, tmux, python3]
+    state: present
+
+- name: Configure chrony NTP servers
+  ansible.builtin.template:
+    src: chrony.conf.j2
+    dest: /etc/chrony.conf
+  notify: restart chronyd
+
+- name: Create cluster admin users
+  ansible.builtin.user:
+    name: "{{ item.name }}"
+    groups: wheel
+    shell: /bin/bash
+  loop: "{{ cluster_admins }}"
+
+# roles/mlnx_ofed/tasks/main.yml  (compute + login + storage nodes with IB/RoCE)
+- name: Download MLNX_OFED ISO
+  ansible.builtin.get_url:
+    url: "{{ mlnx_ofed_iso_url }}"
+    dest: "/tmp/MLNX_OFED-{{ mlnx_ofed_version }}.iso"
+    checksum: "sha256:{{ mlnx_ofed_sha256 }}"
+
+- name: Mount ISO and run mlnxofedinstall
+  ansible.builtin.shell: |
+    mount -o loop /tmp/MLNX_OFED-{{ mlnx_ofed_version }}.iso /mnt/ofed
+    /mnt/ofed/mlnxofedinstall --add-kernel-support --without-fw-update -q
+  args:
+    creates: /usr/bin/ibstat
+  notify: reboot node
+
+- name: Install NVIDIA GPU driver (compute nodes only)
+  ansible.builtin.include_role:
+    name: nvidia_driver
+  when: has_gpu | default(false)
+</code></pre>
+<div class="callout warn"><div class="label">Watch for</div>MLNX_OFED (and its successor DOCA-OFED) must match the running kernel exactly — a kernel update via <code>yum update</code> without rebuilding OFED kernel modules is the single most common way roll-your-own IB clusters silently break. Pin kernel versions in the common role and rebuild/reinstall OFED whenever the kernel bumps, ideally via a CI job rather than manually.</div>
+</div>
+
+<div class="card">
+<h3>Step 4 — Slurm controller, slurmd, and munge key distribution</h3>
+<p>Munge provides the shared-secret authentication between the Slurm controller and every compute node — every host needs the exact same <code>munge.key</code>, generated once and distributed securely (Ansible Vault, not plaintext in git). Slurm itself splits into <code>slurmctld</code> (controller), <code>slurmd</code> (compute), and optionally <code>slurmdbd</code> (accounting database) — each gets installed and started by role, driven by the inventory groups from Step 2.</p>
+<pre><code># playbooks/site.yml
+- hosts: cluster
+  become: true
+  roles:
+    - common
+    - mlnx_ofed
+    - munge
+
+- hosts: slurm_compute
+  become: true
+  roles:
+    - nvidia_driver
+    - slurm_compute
+
+- hosts: slurm_controller
+  become: true
+  roles:
+    - slurm_controller
+
+---
+# roles/munge/tasks/main.yml
+- name: Install munge
+  ansible.builtin.package:
+    name: munge
+    state: present
+
+- name: Distribute munge key (generated once, stored in Ansible Vault)
+  ansible.builtin.copy:
+    content: "{{ vault_munge_key }}"
+    dest: /etc/munge/munge.key
+    owner: munge
+    group: munge
+    mode: "0400"
+  notify: restart munge
+
+---
+# roles/slurm_controller/tasks/main.yml
+- name: Install slurm-slurmctld
+  ansible.builtin.package:
+    name: [slurm-slurmctld, slurm-slurmdbd]
+    state: present
+
+- name: Deploy slurm.conf from inventory-driven template
+  ansible.builtin.template:
+    src: slurm.conf.j2
+    dest: /etc/slurm/slurm.conf
+  notify: restart slurmctld
+
+# slurm.conf.j2 excerpt — node/partition lines built from inventory
+{% for host in groups['slurm_compute'] %}
+NodeName={{ host }} CPUs=64 Gres=gpu:8 State=UNKNOWN
+{% endfor %}
+PartitionName=gpu Nodes={{ groups['slurm_compute'] | join(',') }} Default=YES MaxTime=INFINITE State=UP
+</code></pre>
+<p>Notice the last block: <code>slurm.conf</code> is templated directly from the Ansible inventory, so adding a new compute node is a one-line inventory change plus a re-run of the playbook — the same mechanism BCM or Warewulf give you through their node-group abstraction, just built from primitives you own.</p>
+</div>
+
+<div class="card">
+<h3>Step 5 — Idempotency and drift management</h3>
+<p>The entire value proposition of Ansible collapses if playbooks aren't idempotent — running <code>ansible-playbook site.yml</code> twice in a row should report zero changes the second time. Drift (a node manually patched at 2am during an incident, and never reconciled back into the playbook) is the single biggest operational risk of roll-your-own: there's no CM-tool dashboard flagging "this node doesn't match the golden image."</p>
+<ul>
+<li>Run the full playbook against the fleet on a schedule (nightly or weekly), not just on provisioning day — this is your drift detector. A run with non-zero "changed" tasks against a node nobody touched deliberately is a signal worth investigating.</li>
+<li>Use <code>--check --diff</code> mode in CI or a cron job to report drift without applying it, then alert if diff count exceeds a threshold.</li>
+<li>Treat manual SSH changes on production nodes as an incident-only escape hatch, and follow up by codifying the fix into the role within the same week — otherwise the playbook and reality permanently diverge.</li>
+<li>Pin package versions (Slurm, munge, OFED, GPU driver) explicitly in role variables rather than "latest," so a re-run doesn't silently upgrade something mid-semester.</li>
+</ul>
+</div>
+
+<div class="card">
+<h3>Step 6 — CI/CD for cluster configuration</h3>
+<p>Because the whole cluster definition is just YAML in git, it gets the same review discipline as application code: pull requests, linting, and automated testing before anything touches real hardware.</p>
+<pre><code># .gitlab-ci.yml
+stages: [lint, test, deploy]
+
+lint:
+  stage: lint
+  script:
+    - ansible-lint playbooks/ roles/
+    - yamllint inventory/
+
+molecule-test:
+  stage: test
+  script:
+    - cd roles/slurm_compute
+    - molecule test   # spins up a Docker/Podman instance, converges the role, verifies idempotence
+
+deploy-staging:
+  stage: deploy
+  script:
+    - ansible-playbook -i inventory/staging playbooks/site.yml --diff
+  environment: staging
+  only: [main]
+
+deploy-production:
+  stage: deploy
+  script:
+    - ansible-playbook -i inventory/production playbooks/site.yml --diff
+  when: manual
+  only: [main]
+</code></pre>
+<p><strong>Molecule</strong> tests a role in isolation (spin up a throwaway container, converge, assert idempotence, tear down) — it catches broken roles before they ever run against a real compute node. <strong>ansible-lint</strong> catches style and correctness issues (deprecated modules, missing handlers, unpinned versions) at PR time. Gate production deploys behind a manual approval step; staging can auto-deploy on merge to catch problems on a small test rack first.</p>
+</div>
+
+<h2>Pipeline overview</h2>
+<svg class="diagram" viewBox="0 0 900 400" xmlns="http://www.w3.org/2000/svg">
+<defs>
+<marker id="arrow07a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+<path d="M0,0 L10,5 L0,10 z" fill="#76b900"/>
+</marker>
+</defs>
+<style>
+.n{fill:#1a2437;stroke:#25324a;stroke-width:1.5;rx:8}
+.t{fill:#e8edf4;font-family:sans-serif;font-size:14px;text-anchor:middle}
+.s{fill:#9fb0c3;font-family:sans-serif;font-size:11px;text-anchor:middle}
+.l{stroke:#76b900;stroke-width:2;fill:none;marker-end:url(#arrow07a)}
+</style>
+<rect x="20" y="160" width="140" height="80" class="n"/>
+<text x="90" y="195" class="t">PXE boot +</text>
+<text x="90" y="213" class="t">kickstart</text>
+<text x="90" y="232" class="s">minimal base OS</text>
+
+<rect x="200" y="160" width="150" height="80" class="n"/>
+<text x="275" y="188" class="t">Ansible</text>
+<text x="275" y="206" class="t">inventory</text>
+<text x="275" y="232" class="s">login / compute / storage groups</text>
+
+<rect x="390" y="60" width="150" height="70" class="n"/>
+<text x="465" y="88" class="t">common role</text>
+<text x="465" y="106" class="s">NTP, DNS, users</text>
+
+<rect x="390" y="160" width="150" height="70" class="n"/>
+<text x="465" y="188" class="t">driver roles</text>
+<text x="465" y="206" class="s">MLNX_OFED, GPU</text>
+
+<rect x="390" y="260" width="150" height="70" class="n"/>
+<text x="465" y="288" class="t">munge role</text>
+<text x="465" y="306" class="s">shared key distribution</text>
+
+<rect x="600" y="160" width="150" height="80" class="n"/>
+<text x="675" y="188" class="t">slurm_controller /</text>
+<text x="675" y="206" class="t">slurm_compute</text>
+<text x="675" y="228" class="s">slurmctld + slurmd</text>
+
+<rect x="790" y="160" width="90" height="80" class="n" style="fill:#141c2b;stroke:#76b900"/>
+<text x="835" y="195" class="t">Working</text>
+<text x="835" y="213" class="t">cluster</text>
+
+<line x1="160" y1="200" x2="196" y2="200" class="l"/>
+<line x1="350" y1="185" x2="386" y2="120" class="l"/>
+<line x1="350" y1="200" x2="386" y2="195" class="l"/>
+<line x1="350" y1="220" x2="386" y2="285" class="l"/>
+<line x1="540" y1="95" x2="596" y2="185" class="l"/>
+<line x1="540" y1="195" x2="596" y2="200" class="l"/>
+<line x1="540" y1="290" x2="596" y2="215" class="l"/>
+<line x1="750" y1="200" x2="786" y2="200" class="l"/>
+</svg>
+
+<h2>Inventory group structure</h2>
+<svg class="diagram" viewBox="0 0 900 400" xmlns="http://www.w3.org/2000/svg">
+<defs>
+<marker id="arrow07b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+<path d="M0,0 L10,5 L0,10 z" fill="#4fc3f7"/>
+</marker>
+</defs>
+<style>
+.n2{fill:#1a2437;stroke:#25324a;stroke-width:1.5;rx:8}
+.t2{fill:#e8edf4;font-family:sans-serif;font-size:14px;text-anchor:middle}
+.s2{fill:#9fb0c3;font-family:sans-serif;font-size:11px;text-anchor:middle}
+.l2{stroke:#4fc3f7;stroke-width:2;fill:none;marker-end:url(#arrow07b)}
+</style>
+<rect x="370" y="20" width="160" height="60" class="n2" style="stroke:#76b900"/>
+<text x="450" y="45" class="t2">all / cluster</text>
+<text x="450" y="63" class="s2">shared vars: domain, ntp, munge path</text>
+
+<rect x="60" y="150" width="170" height="70" class="n2"/>
+<text x="145" y="178" class="t2">slurm_controller</text>
+<text x="145" y="196" class="s2">ctrl01</text>
+
+<rect x="280" y="150" width="170" height="70" class="n2"/>
+<text x="365" y="178" class="t2">slurm_login</text>
+<text x="365" y="196" class="s2">login01, login02</text>
+
+<rect x="500" y="150" width="170" height="70" class="n2"/>
+<text x="585" y="172" class="t2">slurm_compute</text>
+<text x="585" y="190" class="s2">gpu[001:032]</text>
+<text x="585" y="205" class="s2">vars: has_gpu, ib_hca</text>
+
+<rect x="720" y="150" width="160" height="70" class="n2"/>
+<text x="800" y="178" class="t2">storage</text>
+<text x="800" y="196" class="s2">nfs01, nfs02</text>
+
+<rect x="60" y="290" width="170" height="60" class="n2" style="fill:#141c2b"/>
+<text x="145" y="315" class="t2">roles applied:</text>
+<text x="145" y="333" class="s2">common, munge, slurm_controller</text>
+
+<rect x="280" y="290" width="170" height="60" class="n2" style="fill:#141c2b"/>
+<text x="365" y="315" class="t2">roles applied:</text>
+<text x="365" y="333" class="s2">common, munge, ofed</text>
+
+<rect x="500" y="290" width="170" height="60" class="n2" style="fill:#141c2b"/>
+<text x="585" y="315" class="t2">roles applied:</text>
+<text x="585" y="333" class="s2">common, ofed, nvidia, slurm_compute</text>
+
+<rect x="720" y="290" width="160" height="60" class="n2" style="fill:#141c2b"/>
+<text x="800" y="315" class="t2">roles applied:</text>
+<text x="800" y="333" class="s2">common, nfs-server</text>
+
+<line x1="420" y1="80" x2="180" y2="146" class="l2"/>
+<line x1="440" y1="80" x2="365" y2="146" class="l2"/>
+<line x1="460" y1="80" x2="580" y2="146" class="l2"/>
+<line x1="480" y1="80" x2="790" y2="146" class="l2"/>
+<line x1="145" y1="220" x2="145" y2="286" class="l2"/>
+<line x1="365" y1="220" x2="365" y2="286" class="l2"/>
+<line x1="585" y1="220" x2="585" y2="286" class="l2"/>
+<line x1="800" y1="220" x2="800" y2="286" class="l2"/>
+</svg>
+
+<h2>Roll-your-own vs. BCM / xCAT / Warewulf</h2>
+<table>
+<thead><tr><th>Dimension</th><th>Ansible + kickstart (roll-your-own)</th><th>BCM / xCAT / Warewulf</th></tr></thead>
+<tbody>
+<tr><td>Cost</td><td>Free (open-source tooling only)</td><td>BCM: paid license per node; xCAT/Warewulf: free but still a full platform to run</td></tr>
+<tr><td>Time to first cluster</td><td>Slower — you assemble the pieces yourself</td><td>Faster — provisioning + image management pre-integrated</td></tr>
+<tr><td>Flexibility</td><td>Total — every piece is a normal Linux tool you already know</td><td>Bounded by the tool's abstractions and supported OS/driver matrix</td></tr>
+<tr><td>Vendor lock-in</td><td>None</td><td>Some (BCM proprietary config format; xCAT/Warewulf communities are smaller)</td></tr>
+<tr><td>Drift management</td><td>Manual discipline (scheduled playbook runs, --check mode)</td><td>Built-in via stateless/golden images (Warewulf) or image sync (BCM)</td></tr>
+<tr><td>Support</td><td>Community / your own team</td><td>BCM: vendor support contract; xCAT/Warewulf: community</td></tr>
+<tr><td>Best fit</td><td>Small-to-mid clusters, cloud/bare-metal hybrid, teams with existing Ansible skill</td><td>Larger clusters, teams wanting a supported turnkey platform</td></tr>
+</tbody>
+</table>
+<div class="callout tip"><div class="label">Rule of thumb</div>If your team already runs Ansible for everything else and the cluster is under a few hundred nodes, roll-your-own is usually the lower total-cost path — you're reusing skills and tooling you already maintain. Past a few hundred nodes, or if the team has no dedicated Linux/Ansible ops capacity, the integrated CM tools start paying for themselves in reduced day-2 toil.</div>
+
+<h2>Further Reading</h2>
+<ul>
+<li><a href="https://docs.ansible.com/ansible/latest/getting_started/index.html" target="_blank" rel="noopener">Ansible Getting Started documentation</a></li>
+<li><a href="https://docs.ansible.com/ansible/latest/inventory_guide/index.html" target="_blank" rel="noopener">Ansible Inventory Guide (grouping hosts by role)</a></li>
+<li><a href="https://github.com/stackhpc/ansible-role-openhpc" target="_blank" rel="noopener">stackhpc/ansible-role-openhpc — OpenHPC v2.x Slurm cluster via Ansible</a></li>
+<li><a href="https://github.com/galaxyproject/ansible-slurm" target="_blank" rel="noopener">galaxyproject/ansible-slurm — Slurm + munge Ansible role</a></li>
+<li><a href="https://github.com/stackhpc/ansible-role-ofed" target="_blank" rel="noopener">stackhpc/ansible-role-ofed — Install OFED from Mellanox repositories</a></li>
+<li><a href="https://network.nvidia.com/products/infiniband-drivers/linux/mlnx_ofed/" target="_blank" rel="noopener">NVIDIA Linux InfiniBand Drivers (MLNX_OFED)</a></li>
+<li><a href="https://slurm.schedmd.com/quickstart_admin.html" target="_blank" rel="noopener">Slurm Quick Start Administrator Guide (SchedMD)</a></li>
+<li><a href="https://openhpc.community/downloads/" target="_blank" rel="noopener">OpenHPC — component builds and install recipes</a></li>
+<li><a href="https://www.theforeman.org/manuals/latest/index.html" target="_blank" rel="noopener">Foreman Manual</a></li>
+<li><a href="https://cobbler.github.io/" target="_blank" rel="noopener">Cobbler — Linux install/provisioning server</a></li>
+<li><a href="https://maas.io/docs" target="_blank" rel="noopener">Canonical MAAS Documentation</a></li>
+<li><a href="https://developer.hashicorp.com/packer/docs" target="_blank" rel="noopener">HashiCorp Packer Documentation</a></li>
+<li><a href="https://ansible.readthedocs.io/projects/lint/" target="_blank" rel="noopener">ansible-lint documentation</a></li>
+<li><a href="https://ansible.readthedocs.io/projects/molecule/" target="_blank" rel="noopener">Molecule — Ansible role testing framework</a></li>
+</ul>
+
+<div class="section-nav"><a href="06-provisioning-warewulf-openhpc.html">← Warewulf + OpenHPC</a><a href="08-scheduling.html">Next: Job Schedulers →</a></div>
+</main></div>
+<footer><div class="wrap">Part of the HPC Cluster Build Guide.</div></footer>
+</body>
+</html>

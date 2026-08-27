@@ -1,0 +1,179 @@
+<!DOCTYPE html>
+<html data-theme="dark">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>IaC — Provisioning Cluster Infrastructure with Terraform | HPC Cluster Build Guide</title>
+<link rel="stylesheet" href="../assets/css/style.css">
+</head>
+<body>
+<header class="top"><div class="wrap"><a href="../index.html">HPC Cluster Build Guide</a><span class="badge">Public Edition</span></div></header>
+<div class="wrap"><nav class="crumbs"><a href="19-csp-comparison.html">← CSP Comparison</a></nav>
+<main>
+
+<h1>20 — Infrastructure as Code: Provisioning Cluster Infrastructure with Terraform</h1>
+<p class="lede">Section 07 covered Ansible and bare-metal provisioning — turning already-existing servers into a working cluster. This section is one layer below that: how the cloud resources those servers (or node pools) live on get created in the first place. Terraform is the most widely used tool for that "day 0" job — declaring a VPC, subnets, IAM roles, storage, and GPU node pools as code, before any configuration-management tool ever touches a node.</p>
+
+<h2>Where Terraform sits in the stack</h2>
+<p>It's easy to conflate Terraform and Ansible because both are "infrastructure automation," but they solve different problems and operate at different layers:</p>
+<div class="grid2">
+<div class="card">
+<h3>Terraform — infrastructure provisioning</h3>
+<ul>
+<li>Creates the cloud resources themselves: VPC/VNet, subnets, route tables, security groups, IAM roles/policies, compute instances or managed node pools, block/object storage, load balancers</li>
+<li>Declarative — you describe the desired end state, Terraform computes a diff and a plan to get there</li>
+<li>Tracks a <strong>state file</strong> mapping your config to real-world resource IDs</li>
+<li>Answers: "does this VPC, subnet, and GPU node pool exist, with these exact settings?"</li>
+</ul>
+</div>
+<div class="card">
+<h3>Ansible — configuration management</h3>
+<ul>
+<li>Configures the operating system <em>inside</em> resources that already exist: packages, users, drivers, Slurm, munge</li>
+<li>Procedural-declarative hybrid — runs tasks against live hosts over SSH</li>
+<li>Mostly stateless between runs — re-derives current state by inspecting the host each time</li>
+<li>Answers: "is this VM/node running the right kernel, drivers, and Slurm config?"</li>
+</ul>
+</div>
+</div>
+<p>In a typical GPU cluster build, Terraform runs first to stand up the VPC, subnets, IAM roles, storage buckets, and the compute instances or node pool that will become login/compute/controller nodes. Once those instances exist and are reachable, Ansible (or a cluster-management tool like Bright/Warewulf) takes over and brings the OS on each node to a known-good state — the same split of responsibility as bare-metal PXE/kickstart handing off to Ansible in section 07, just with cloud API calls standing in for a physical power-on.</p>
+
+<h2>Provisioning layer stack</h2>
+<svg class="diagram" viewBox="0 0 900 300" xmlns="http://www.w3.org/2000/svg">
+<defs>
+<marker id="arrow20a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+<path d="M0,0 L10,5 L0,10 z" fill="#76b900"/>
+</marker>
+</defs>
+<style>
+.n{fill:#1a2437;stroke:#25324a;stroke-width:1.5;rx:8}
+.t{fill:#e8edf4;font-family:sans-serif;font-size:14px;text-anchor:middle}
+.s{fill:#9fb0c3;font-family:sans-serif;font-size:11px;text-anchor:middle}
+.l{stroke:#76b900;stroke-width:2;fill:none;marker-end:url(#arrow20a)}
+</style>
+<rect x="30" y="30" width="840" height="70" class="n" style="stroke:#76b900"/>
+<text x="450" y="58" class="t">Terraform — "day 0" infrastructure layer</text>
+<text x="450" y="78" class="s">VPC/VNet, subnets, IAM roles, storage, GPU node pools, load balancers</text>
+
+<rect x="30" y="130" width="840" height="70" class="n"/>
+<text x="450" y="158" class="t">Ansible / cluster-management tool — "day 1" configuration layer</text>
+<text x="450" y="178" class="s">OS packages, drivers (GPU/OFED), users, Slurm, munge — runs on top of what Terraform created</text>
+
+<rect x="30" y="230" width="840" height="60" class="n" style="fill:#141c2b"/>
+<text x="450" y="255" class="t">Working GPU cluster</text>
+<text x="450" y="273" class="s">jobs scheduled, IB/RoCE fabric live, storage mounted</text>
+
+<line x1="450" y1="100" x2="450" y2="126" class="l"/>
+<line x1="450" y1="200" x2="450" y2="226" class="l"/>
+</svg>
+
+<h2>Core Terraform concepts</h2>
+<table>
+<thead><tr><th>Concept</th><th>What it is</th></tr></thead>
+<tbody>
+<tr><td>Provider</td><td>A plugin that talks to a specific API — <code>aws</code>, <code>google</code>, <code>azurerm</code> — translating HCL resource blocks into cloud API calls</td></tr>
+<tr><td>Resource</td><td>A single managed object: one VPC, one subnet, one node pool, one IAM role</td></tr>
+<tr><td>Module</td><td>A reusable, parameterized bundle of resources — e.g. a "GPU node pool" module callable once per cloud with different variables</td></tr>
+<tr><td>State</td><td>A file (<code>terraform.tfstate</code>) mapping your config to real resource IDs — Terraform diffs desired vs. actual state on every plan</td></tr>
+<tr><td>Backend</td><td>Where state lives — local disk by default, or a remote backend (S3, GCS, Azure Blob, Terraform Cloud) for team use</td></tr>
+<tr><td>State locking</td><td>A mutex on the state file so two concurrent <code>apply</code> runs can't corrupt it — implemented via DynamoDB, GCS native locking, or the backend's built-in lock API</td></tr>
+</tbody>
+</table>
+<div class="callout tip"><div class="label">Rule of thumb</div>Never run Terraform against local state for anything beyond a solo experiment. The moment more than one person (or a CI pipeline) touches a cluster's infrastructure, a remote backend with locking is mandatory — local state has no way to prevent two concurrent applies from clobbering each other.</div>
+
+<h2>A reusable GPU node pool module</h2>
+<p>The pattern that scales across clouds is a small, parameterized module — one Terraform module per logical resource (a GPU node pool, a VPC, a storage bucket) — called once per provider with provider-specific variables. This keeps the calling code (the "root module" for a given cluster) short and readable, and lets you reason about a GPU node pool the same way regardless of which cloud it's on.</p>
+<pre><code># modules/gpu-node-pool/variables.tf
+variable "cluster_name"     { type = string }
+variable "node_count"       { type = number }
+variable "gpu_instance_type" { type = string }   # e.g. p5.48xlarge / a3-highgpu-8g / Standard_ND96isr_H100_v5
+variable "subnet_id"        { type = string }
+variable "labels"           { type = map(string), default = {} }
+
+# modules/gpu-node-pool/main.tf (AWS example — EKS managed node group)
+resource "aws_eks_node_group" "gpu" {
+  cluster_name    = var.cluster_name
+  node_group_name = "${var.cluster_name}-gpu"
+  node_role_arn   = aws_iam_role.node.arn
+  subnet_ids      = [var.subnet_id]
+
+  scaling_config {
+    desired_size = var.node_count
+    max_size     = var.node_count
+    min_size     = var.node_count
+  }
+
+  instance_types = [var.gpu_instance_type]
+  labels         = merge(var.labels, { "nvidia.com/gpu" = "true" })
+
+  taint {
+    key    = "nvidia.com/gpu"
+    value  = "true"
+    effect = "NO_SCHEDULE"
+  }
+}
+</code></pre>
+<p>Calling this same module shape against GCP swaps <code>aws_eks_node_group</code> for <code>google_container_node_pool</code>, and against Azure for <code>azurerm_kubernetes_cluster_node_pool</code> — the variables (<code>cluster_name</code>, <code>node_count</code>, <code>gpu_instance_type</code>) stay conceptually the same even though the underlying resource type is provider-specific. Teams building multi-cloud GPU capacity typically keep one module per provider behind a common variable interface, rather than trying to force a single resource block to be truly cloud-agnostic.</p>
+
+<h2>Terraform + cluster-build-tool integration</h2>
+<p>Terraform rarely stands alone in an HPC build — it's often the engine underneath a higher-level cluster tool, or the surrounding-infrastructure layer next to one:</p>
+<ul>
+<li><strong>Google Cloud Cluster Toolkit</strong> (formerly Cloud HPC Toolkit) is Terraform-based under the hood: you author a YAML "blueprint," the <code>gcluster</code> CLI compiles it into a deployment folder containing generated Terraform (and Packer) configuration, which you then apply directly.</li>
+<li><strong>AWS ParallelCluster</strong> has an official Terraform provider and module (from ParallelCluster 3.8.0+) — Terraform manages the surrounding VPC, subnets, and networking, while the ParallelCluster provider manages the cluster resource itself, so the whole stack — network plus cluster — is defined in one HCL codebase.</li>
+<li><strong>Azure CycleCloud / AKS</strong> and most managed Kubernetes-based GPU platforms expose Terraform providers (<code>azurerm</code>, <code>google</code>, <code>aws</code>) for the surrounding VNet/VPC and node pool resources, even when the scheduler layer on top is configured by a separate tool.</li>
+</ul>
+<p>The practical pattern: Terraform owns the network, IAM, storage, and node pool/instance layer everywhere; whatever sits above it (Slurm via Ansible, Kubernetes via a cluster tool, a vendor's own installer) consumes the IDs Terraform outputs — VPC ID, subnet IDs, node pool name — as inputs.</p>
+
+<h2>State management at scale</h2>
+<p>State is the single most operationally sensitive artifact in a Terraform workflow — lose it or corrupt it and Terraform no longer knows what it manages. At team scale, three practices matter:</p>
+<ul>
+<li><strong>Remote backends</strong> — store state in S3 (with an S3-native lock or a DynamoDB lock table), Google Cloud Storage, Azure Blob, or Terraform Cloud/Enterprise, never on a laptop disk.</li>
+<li><strong>Workspaces</strong> — Terraform workspaces (or, more robustly, separate state files per environment via directory/backend-key separation) keep dev/staging/production or per-cluster state fully isolated, so an <code>apply</code> against one workspace can never touch another's resources.</li>
+<li><strong>State locking</strong> — the backend takes a lock before any plan/apply that could write state, and releases it after. This is what prevents two engineers (or a human and a CI job) from applying concurrently and corrupting the state file.</li>
+</ul>
+
+<h2>CI/CD for Terraform</h2>
+<p>Because Terraform changes can create, modify, or destroy real cloud infrastructure, the review discipline around it is typically stricter than application code CI:</p>
+<pre><code># .gitlab-ci.yml (excerpt)
+stages: [validate, plan, apply]
+
+validate:
+  script:
+    - terraform fmt -check
+    - terraform validate
+
+plan:
+  script:
+    - terraform plan -out=tfplan
+  artifacts:
+    paths: [tfplan]
+
+apply:
+  script:
+    - terraform apply tfplan
+  when: manual        # human approval gate before anything touches real infra
+  only: [main]
+</code></pre>
+<p>The core pattern is <strong>plan/apply gating</strong>: every merge request runs <code>terraform plan</code> and posts the diff for human review; <code>apply</code> only runs against the exact plan that was reviewed (not a fresh plan at apply time, which could drift from what was approved), and production applies are gated behind manual approval. A separate scheduled job running <code>terraform plan</code> with no apply step doubles as a drift detector — if it reports changes against infrastructure nobody touched via Terraform, something was modified out-of-band (a console change, a manual fix during an incident) and needs reconciling.</p>
+
+<h2>Further Reading</h2>
+<ul>
+<li><a href="https://developer.hashicorp.com/terraform/docs" target="_blank" rel="noopener">HashiCorp Terraform Documentation</a></li>
+<li><a href="https://developer.hashicorp.com/terraform/language/state" target="_blank" rel="noopener">Terraform State — official documentation</a></li>
+<li><a href="https://developer.hashicorp.com/terraform/language/state/locking" target="_blank" rel="noopener">Terraform State Locking — official documentation</a></li>
+<li><a href="https://developer.hashicorp.com/terraform/language/backend" target="_blank" rel="noopener">Terraform Backends</a></li>
+<li><a href="https://registry.terraform.io/providers/hashicorp/aws/latest/docs" target="_blank" rel="noopener">Terraform AWS Provider documentation</a></li>
+<li><a href="https://registry.terraform.io/providers/hashicorp/google/latest/docs" target="_blank" rel="noopener">Terraform Google Cloud Provider documentation</a></li>
+<li><a href="https://registry.terraform.io/providers/hashicorp/azurerm/latest/docs" target="_blank" rel="noopener">Terraform AzureRM Provider documentation</a></li>
+<li><a href="https://docs.cloud.google.com/cluster-toolkit/docs/overview" target="_blank" rel="noopener">Google Cloud Cluster Toolkit overview (Terraform-based)</a></li>
+<li><a href="https://github.com/GoogleCloudPlatform/cluster-toolkit" target="_blank" rel="noopener">GoogleCloudPlatform/cluster-toolkit on GitHub</a></li>
+<li><a href="https://docs.aws.amazon.com/parallelcluster/latest/ug/terraform-what-is.html" target="_blank" rel="noopener">AWS ParallelCluster for Terraform — official documentation</a></li>
+<li><a href="https://registry.terraform.io/modules/aws-tf/parallelcluster/aws/latest" target="_blank" rel="noopener">aws-tf/parallelcluster Terraform module (Terraform Registry)</a></li>
+<li><a href="https://github.com/terraform-aws-modules" target="_blank" rel="noopener">terraform-aws-modules — community module collection on GitHub</a></li>
+</ul>
+
+<div class="section-nav"><a href="19-csp-comparison.html">← CSP Comparison</a><a href="21-iac-ansible-fullstack.html">Next: IaC — Ansible Full-Stack →</a></div>
+</main></div>
+<footer><div class="wrap">Part of the HPC Cluster Build Guide.</div></footer>
+</body>
+</html>

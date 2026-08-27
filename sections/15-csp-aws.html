@@ -1,0 +1,165 @@
+<!DOCTYPE html>
+<html data-theme="dark" lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>15 — CSP Build: AWS | HPC Cluster Build Guide</title>
+<link rel="stylesheet" href="../assets/css/style.css">
+</head>
+<body>
+<header class="top"><div class="wrap"><a href="../index.html">HPC Cluster Build Guide</a><span class="badge">Public Edition</span></div></header>
+<div class="wrap"><nav class="crumbs"><a href="14-network-fabrics-deep-dive.html">← Network Fabrics Deep-Dive</a></nav>
+<main>
+
+<h1>15 — CSP Build: AWS</h1>
+<p class="lede">Everything in this guide so far has assumed you own the racks. If you're building your GPU cluster on AWS instead, the physical layer disappears and is replaced by three things you configure through APIs: the right GPU instance type, a low-latency RDMA-capable network fabric called EFA, and an orchestration tool — AWS ParallelCluster — that plays the same role BCM, xCAT, or Warewulf played in the on-prem guides. This page walks through all three, plus the storage and networking building blocks a real build needs.</p>
+
+<h2>GPU instance types</h2>
+<p>AWS's GPU compute lineup for large-scale training and HPC centers on the P-series, with Trn-series as a non-NVIDIA alternative for specific workloads:</p>
+<ul>
+  <li><strong>P5</strong> — 8× NVIDIA H100 GPUs (80GB HBM3 each, 640GB total), NVSwitch-connected for 900GB/s GPU-to-GPU bandwidth, 3rd Gen AMD EPYC CPUs, 2TB system memory, up to 3200Gbps EFA networking. This is the default choice for large H100 training clusters on AWS.</li>
+  <li><strong>P5e / P5en</strong> — the H200 refresh: 8× H200 GPUs with 1.7x the memory and 1.4x the memory bandwidth of H100, paired with 4th Gen Intel Xeon CPUs (P5en) for Gen5 PCIe CPU↔GPU bandwidth and a newer EFA/Nitro generation with lower latency.</li>
+  <li><strong>P4d / P4de</strong> — the previous generation: 8× NVIDIA A100 GPUs (40GB on P4d, 80GB on P4de), still widely used for cost-sensitive training and inference workloads that don't need H100/H200-class throughput.</li>
+  <li><strong>Trn1 / Trn2</strong> — AWS's own Trainium accelerators, relevant if your workload targets AWS's Neuron SDK rather than CUDA. Mentioned here for completeness; this guide's tooling (Slurm, EFA, ParallelCluster) applies to Trainium instances too, but the software stack above the network layer is different from an NVIDIA GPU cluster and is out of scope for this page.</li>
+</ul>
+
+<h2>EFA — AWS's RDMA fabric</h2>
+<p>Elastic Fabric Adapter (EFA) is AWS's answer to InfiniBand: a network interface that supports OS-bypass, low-latency communication using the Scalable Reliable Datagram (SRD) protocol, layered under standard MPI/NCCL libraries via libfabric. On P4d and later GPU instances, EFA also supports NVIDIA GPUDirect RDMA, letting the NIC read and write GPU memory directly without staging through host memory — the same fundamental optimization that InfiniBand-with-GPUDirect provides on-prem. For multi-node NCCL collective communication (all-reduce during distributed training), EFA is what makes AWS GPU instances usable at scale instead of falling back to slow TCP/IP over the standard ENA network interface.</p>
+<p>Two things matter operationally: EFA is only available on specific instance types and sizes (the full P5/P4d family qualifies), and it only reaches full performance when instances are launched into a <strong>cluster placement group</strong> — a placement strategy that packs instances close together on the physical network to minimize inter-node latency. ParallelCluster handles both automatically when EFA is enabled in the config.</p>
+
+<h2>AWS ParallelCluster</h2>
+<p>AWS ParallelCluster is AWS's open-source, AWS-supported cluster deployment tool — the direct AWS-native equivalent of BCM or Warewulf from earlier in this guide. Instead of provisioning bare metal, it provisions AWS resources: it reads a YAML config file describing your desired cluster, then uses AWS CloudFormation under the hood to stand up a VPC-attached head node, an auto-scaling compute fleet, a Slurm controller and workload manager configuration, and optional shared storage — all from one <code>pcluster create-cluster</code> command.</p>
+<p>At a high level, a ParallelCluster cluster has:</p>
+<ul>
+  <li><strong>A head node</strong> — runs Slurm's controller (<code>slurmctld</code>), the ParallelCluster agent, and typically serves as the login/submission node.</li>
+  <li><strong>One or more compute fleets (queues)</strong> — Slurm partitions backed by EC2 Auto Scaling groups, each mapped to a specific instance type (e.g. a <code>gpu</code> queue on P5, a <code>cpu</code> queue on general-purpose instances). Nodes scale from zero and terminate when idle, so you only pay for GPU time actually used.</li>
+  <li><strong>Shared storage</strong> — typically FSx for Lustre for scratch/training data, mounted on every node.</li>
+  <li><strong>Networking</strong> — a VPC, subnets, and (for the GPU queue) EFA + cluster placement group configuration.</li>
+</ul>
+
+<h2>FSx for Lustre — parallel storage</h2>
+<p>Amazon FSx for Lustre is AWS's managed parallel file system — the cloud equivalent of the Lustre or GPFS storage covered in guide 03. It's built for exactly the profile a GPU training job needs: high aggregate throughput (terabytes per second at scale), high IOPS, and the ability to mount the same namespace across thousands of compute nodes concurrently. It can also link directly to an S3 bucket, transparently presenting S3 objects as files and syncing writes back, which makes it convenient for training jobs that read datasets staged in S3. ParallelCluster can create a new FSx for Lustre file system as part of cluster creation, or attach an existing one.</p>
+
+<h2>VPC and networking design</h2>
+<p>A minimal but realistic AWS cluster VPC has: one VPC, a private subnet for compute and head nodes (GPU instances generally shouldn't have public IPs), a public subnet with a NAT gateway for outbound package/container pulls, and security groups scoped so cluster-internal traffic (Slurm, NFS/Lustre, EFA) is allowed between cluster nodes but nothing is open to the internet inbound. The GPU compute subnet should be placed in a single Availability Zone — cluster placement groups and EFA both require this, since spreading GPU nodes across AZs breaks the low-latency guarantee the fabric depends on.</p>
+
+<h2>IAM roles</h2>
+<p>ParallelCluster needs IAM permissions at two levels: the identity running <code>pcluster</code> commands needs broad permissions to create the CloudFormation stack, VPC resources, EC2 instances, and IAM roles themselves; and the cluster's EC2 instances need an instance role (attached automatically by ParallelCluster) granting the head and compute nodes permission to call EC2 (for Slurm's dynamic scaling), CloudWatch (for logging), and S3/FSx as needed for storage access. Production deployments typically scope both down from the AWS-managed policy ParallelCluster ships with to a tighter, reviewed policy.</p>
+
+<h2>Step-by-step: building a cluster with ParallelCluster</h2>
+
+<div class="card">
+<h3>Step 1 — Install and configure the CLI</h3>
+<p><code>pip install aws-parallelcluster</code>, then run <code>pcluster configure</code> for an interactive wizard, or hand-write the config YAML directly (shown below). You'll need an existing VPC and subnets, or let the wizard create them.</p>
+</div>
+
+<div class="card">
+<h3>Step 2 — Write the cluster config</h3>
+<p>A realistic minimal GPU training cluster config looks like this:</p>
+<pre><code>Region: us-east-1
+Image:
+  Os: alinux2
+
+HeadNode:
+  InstanceType: c5.2xlarge
+  Networking:
+    SubnetId: subnet-0a1b2c3d4e5f6g7h8
+  Ssh:
+    KeyName: my-cluster-keypair
+
+Scheduling:
+  Scheduler: slurm
+  SlurmQueues:
+    - Name: gpu
+      ComputeResources:
+        - Name: p5-48xlarge
+          InstanceType: p5.48xlarge
+          MinCount: 0
+          MaxCount: 32
+          Efa:
+            Enabled: true
+      Networking:
+        SubnetIds:
+          - subnet-0a1b2c3d4e5f6g7h8
+        PlacementGroup:
+          Enabled: true
+
+SharedStorage:
+  - MountDir: /fsx
+    Name: fsx-scratch
+    StorageType: FsxLustre
+    FsxLustreSettings:
+      StorageCapacity: 4800
+      DeploymentType: SCRATCH_2
+</code></pre>
+</div>
+
+<div class="card">
+<h3>Step 3 — Create the cluster</h3>
+<p><code>pcluster create-cluster --cluster-name gpu-train-01 --cluster-configuration cluster-config.yaml</code>. ParallelCluster translates the config into a CloudFormation template and deploys it — this creates the head node, Slurm configuration, FSx file system, and Auto Scaling group for the <code>gpu</code> queue, typically in 10-15 minutes.</p>
+</div>
+
+<div class="card">
+<h3>Step 4 — Connect and submit jobs</h3>
+<p><code>pcluster ssh --cluster-name gpu-train-01 -i my-key.pem</code> logs into the head node, where a standard Slurm environment is waiting: <code>sinfo</code> shows the <code>gpu</code> partition, and <code>sbatch</code>/<code>srun</code> work exactly as they do on an on-prem Slurm cluster. Requesting nodes triggers the Auto Scaling group to launch P5 instances, which join the fleet and pick up the job once EFA and NCCL are confirmed healthy.</p>
+</div>
+
+<h2>Diagram: ParallelCluster architecture on AWS</h2>
+<svg class="diagram" viewBox="0 0 900 380" xmlns="http://www.w3.org/2000/svg">
+  <style>
+    .lbl{font-family:sans-serif;font-size:13px;fill:#e8edf4}
+    .lbl2{font-family:sans-serif;font-size:11px;fill:#9fb0c3}
+    .box{fill:#1a2437;stroke:#25324a;stroke-width:1.5}
+    .accent{fill:#141c2b;stroke:#76b900;stroke-width:2}
+    .line{stroke:#4fc3f7;stroke-width:1.5;fill:none}
+    .line2{stroke:#76b900;stroke-width:1.5;fill:none}
+  </style>
+  <rect x="20" y="20" width="860" height="340" fill="#0d1420" stroke="#25324a"/>
+  <text x="450" y="42" text-anchor="middle" class="lbl2">VPC (single Availability Zone for GPU subnet)</text>
+
+  <rect x="340" y="55" width="220" height="70" rx="8" class="accent"/>
+  <text x="450" y="78" text-anchor="middle" class="lbl" font-weight="bold">Head Node</text>
+  <text x="450" y="96" text-anchor="middle" class="lbl2">slurmctld + ParallelCluster agent</text>
+  <text x="450" y="112" text-anchor="middle" class="lbl2">private subnet</text>
+
+  <rect x="60" y="170" width="200" height="60" rx="6" class="box"/>
+  <text x="160" y="192" text-anchor="middle" class="lbl">Slurm queue: gpu</text>
+  <text x="160" y="210" text-anchor="middle" class="lbl2">P5.48xlarge + EFA + placement group</text>
+
+  <rect x="350" y="170" width="200" height="60" rx="6" class="box"/>
+  <text x="450" y="192" text-anchor="middle" class="lbl">Slurm queue: cpu</text>
+  <text x="450" y="210" text-anchor="middle" class="lbl2">general-purpose, autoscaled 0-N</text>
+
+  <rect x="640" y="170" width="200" height="60" rx="6" class="box"/>
+  <text x="740" y="192" text-anchor="middle" class="lbl">FSx for Lustre</text>
+  <text x="740" y="210" text-anchor="middle" class="lbl2">mounted at /fsx on all nodes</text>
+
+  <line x1="450" y1="125" x2="160" y2="170" class="line2"/>
+  <line x1="450" y1="125" x2="450" y2="170" class="line2"/>
+  <line x1="450" y1="125" x2="740" y2="170" class="line2"/>
+
+  <rect x="60" y="270" width="90" height="45" rx="6" class="box"/>
+  <text x="105" y="296" text-anchor="middle" class="lbl2">P5 node 1</text>
+  <rect x="170" y="270" width="90" height="45" rx="6" class="box"/>
+  <text x="215" y="296" text-anchor="middle" class="lbl2">P5 node 2</text>
+  <line x1="160" y1="230" x2="105" y2="270" class="line"/>
+  <line x1="160" y1="230" x2="215" y2="270" class="line"/>
+  <text x="450" y="345" text-anchor="middle" class="lbl2">EFA fabric connects GPU nodes for NCCL collectives (all-reduce) within the placement group</text>
+</svg>
+
+<h2>Further Reading</h2>
+<ul>
+  <li><a href="https://docs.aws.amazon.com/parallelcluster/latest/ug/what-is-aws-parallelcluster.html" target="_blank" rel="noopener">AWS ParallelCluster User Guide</a></li>
+  <li><a href="https://docs.aws.amazon.com/parallelcluster/latest/ug/cluster-configuration-file-v3.html" target="_blank" rel="noopener">AWS ParallelCluster — Cluster Configuration File Reference</a></li>
+  <li><a href="https://docs.aws.amazon.com/parallelcluster/latest/ug/efa-v3.html" target="_blank" rel="noopener">AWS ParallelCluster — Elastic Fabric Adapter</a></li>
+  <li><a href="https://aws.amazon.com/hpc/efa/" target="_blank" rel="noopener">AWS — Elastic Fabric Adapter Product Page</a></li>
+  <li><a href="https://aws.amazon.com/ec2/instance-types/p5/" target="_blank" rel="noopener">Amazon EC2 P5 Instances</a></li>
+  <li><a href="https://aws.amazon.com/fsx/lustre/" target="_blank" rel="noopener">Amazon FSx for Lustre</a></li>
+</ul>
+
+<div class="section-nav"><a href="14-network-fabrics-deep-dive.html">← Network Fabrics Deep-Dive</a><a href="16-csp-gcp.html">Next: CSP Build — GCP →</a></div>
+</main>
+</div>
+<footer><div class="wrap">Part of the HPC Cluster Build Guide.</div></footer>
+</body>
+</html>

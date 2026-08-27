@@ -1,0 +1,383 @@
+<!DOCTYPE html>
+<html data-theme="dark" lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>00 — Introduction &amp; The HPC Stack Overview | HPC Cluster Build Guide</title>
+<link rel="stylesheet" href="../assets/css/style.css">
+</head>
+<body>
+<header class="top">
+  <div class="wrap">
+    <a href="../index.html">HPC Cluster Build Guide</a>
+    <span class="badge">Public Edition</span>
+  </div>
+</header>
+
+<div class="wrap">
+<nav class="crumbs"><!--CRUMBS--><a href="../index.html">Home</a> / 00 — Introduction &amp; The HPC Stack Overview</nav>
+
+<main>
+  <h1>00 — Introduction &amp; The HPC Stack Overview</h1>
+  <p class="lede">
+    A High-Performance Computing (HPC) cluster is not "a bunch of powerful servers." It's dozens,
+    hundreds, or tens of thousands of computers wired together with a purpose-built network so they
+    behave, for the duration of a job, like a single enormous machine. This section gives you the
+    mental model you need before touching any hardware: what a cluster actually is, how its layers
+    stack on top of each other, who builds and runs it, and how the rest of this guide is organized.
+  </p>
+
+  <h2>What Makes a Cluster Different From "Just a Bunch of Servers"</h2>
+  <p>
+    If you've used cloud virtual machines, you already understand renting compute. Spin up a VM,
+    SSH in, run your code, shut it down. An HPC cluster shares some DNA with that world but solves a
+    fundamentally different problem: <strong>tightly-coupled, large-scale parallel work</strong> where
+    hundreds of processors need to exchange data with each other in microseconds, not milliseconds.
+  </p>
+  <div class="grid2">
+    <div class="card">
+      <h3>Cloud VM / Single Server</h3>
+      <p>One machine (or a loosely related fleet) does independent work. Network between VMs is
+      "good enough" Ethernet through a virtualized layer. Storage is usually a remote block or
+      object volume attached over the same general-purpose network. Scheduling is "start this VM
+      when I ask" — there's no queue of competing jobs fighting over the same physical fabric.</p>
+    </div>
+    <div class="card">
+      <h3>HPC Cluster</h3>
+      <p>Hundreds of physical nodes run <em>one logical job</em> split across all of them
+      simultaneously (e.g., training one large model, or one weather simulation). They need a
+      low-latency, high-bandwidth fabric (InfiniBand or RDMA-capable Ethernet) so GPUs on different
+      physical machines can talk almost as fast as GPUs inside the same machine. A scheduler
+      (Slurm, PBS, LSF) decides whose job runs where and enforces fair sharing of a fixed, expensive
+      pool of hardware.</p>
+    </div>
+  </div>
+  <div class="callout tip">
+    <div class="label">Why this matters</div>
+    Every design decision downstream in this guide — the fabric you pick, the storage you choose,
+    how you provision nodes, how you schedule jobs — flows from this one fact: a cluster's job is to
+    make many physical computers act like one very large computer for the length of a single
+    computation.
+  </div>
+
+  <h2>The Layered Mental Model</h2>
+  <p>
+    The cleanest way to understand an HPC cluster is as a stack of layers, each one built on top of
+    the one below it. This is the same order this guide follows, section by section.
+  </p>
+
+  <svg class="diagram" viewBox="0 0 900 480" role="img" aria-label="Layered HPC stack diagram">
+    <style>
+      .lyr{fill:#1a2437;stroke:#25324a;stroke-width:1.5}
+      .lyrtxt{fill:#e8edf4;font-family:sans-serif;font-size:17px;font-weight:600}
+      .lyrsub{fill:#9fb0c3;font-family:sans-serif;font-size:12px}
+      .accent{fill:#76b900}
+      .accent2{fill:#4fc3f7}
+    </style>
+    <text x="450" y="28" text-anchor="middle" class="lyrtxt" font-size="18">The HPC Stack (bottom to top)</text>
+
+    <!-- Layer 8: Monitoring -->
+    <rect x="60" y="45" width="780" height="42" rx="6" class="lyr" stroke="#4fc3f7"/>
+    <text x="450" y="71" text-anchor="middle" class="lyrtxt">8. Monitoring &amp; Observability</text>
+    <text x="450" y="84" text-anchor="middle" class="lyrsub">DCGM · Prometheus · Grafana — see it's healthy, catch failures early</text>
+
+    <!-- Layer 7: User env -->
+    <rect x="60" y="93" width="780" height="42" rx="6" class="lyr"/>
+    <text x="450" y="119" text-anchor="middle" class="lyrtxt">7. User Environment</text>
+    <text x="450" y="132" text-anchor="middle" class="lyrsub">Modules, containers, conda, Spack — what a user actually loads to run code</text>
+
+    <!-- Layer 6: Identity -->
+    <rect x="60" y="141" width="780" height="42" rx="6" class="lyr"/>
+    <text x="450" y="167" text-anchor="middle" class="lyrtxt">6. Identity &amp; Auth</text>
+    <text x="450" y="180" text-anchor="middle" class="lyrsub">LDAP / SSSD — who is allowed to log in, and as which user/group</text>
+
+    <!-- Layer 5: Scheduler -->
+    <rect x="60" y="189" width="780" height="42" rx="6" class="lyr" stroke="#76b900"/>
+    <text x="450" y="215" text-anchor="middle" class="lyrtxt">5. Job Scheduler</text>
+    <text x="450" y="228" text-anchor="middle" class="lyrsub">Slurm / PBS / LSF — decides whose job runs where and when</text>
+
+    <!-- Layer 4: OS/Provisioning -->
+    <rect x="60" y="237" width="780" height="42" rx="6" class="lyr"/>
+    <text x="450" y="263" text-anchor="middle" class="lyrtxt">4. OS &amp; Provisioning</text>
+    <text x="450" y="276" text-anchor="middle" class="lyrsub">BCM / xCAT / Warewulf / Ansible — installs and configures every node's OS</text>
+
+    <!-- Layer 3: Storage -->
+    <rect x="60" y="285" width="780" height="42" rx="6" class="lyr"/>
+    <text x="450" y="311" text-anchor="middle" class="lyrtxt">3. Storage</text>
+    <text x="450" y="324" text-anchor="middle" class="lyrsub">Lustre / GPFS / NFS / BeeGFS — shared, fast, parallel filesystems</text>
+
+    <!-- Layer 2: Fabric -->
+    <rect x="60" y="333" width="780" height="42" rx="6" class="lyr" stroke="#76b900"/>
+    <text x="450" y="359" text-anchor="middle" class="lyrtxt">2. Networking &amp; Fabric</text>
+    <text x="450" y="372" text-anchor="middle" class="lyrsub">InfiniBand / RoCE / RDMA — the low-latency highway between nodes</text>
+
+    <!-- Layer 1: Hardware -->
+    <rect x="60" y="381" width="780" height="42" rx="6" class="lyr"/>
+    <text x="450" y="407" text-anchor="middle" class="lyrtxt">1. Compute &amp; Hardware</text>
+    <text x="450" y="420" text-anchor="middle" class="lyrsub">CPUs, GPUs, NVLink/NVSwitch — the physical silicon doing the work</text>
+
+    <text x="450" y="450" text-anchor="middle" class="lyrsub" font-size="13">Every layer depends on the ones below it. Build bottom-up; troubleshoot top-down.</text>
+  </svg>
+
+  <p>
+    Read the stack bottom-up as "what's built on what," and top-down as "what a user actually
+    touches." A researcher submitting a job never thinks about InfiniBand cabling — but if the
+    fabric layer is misconfigured, their job silently runs 10x slower or fails to scale, and the
+    symptom shows up all the way at the top, in the scheduler and the user's log file.
+  </p>
+
+  <h2>Anatomy of a Cluster</h2>
+  <p>
+    Zoom into the hardware/network picture and every HPC cluster — from a 16-node university lab
+    rig to a multi-thousand-GPU NVIDIA DGX SuperPOD — is built from the same recognizable parts.
+  </p>
+
+  <svg class="diagram" viewBox="0 0 900 420" role="img" aria-label="Cluster anatomy diagram showing head node, login node, compute nodes, management network, high speed fabric, and storage nodes">
+    <style>
+      .box{fill:#1a2437;stroke:#25324a;stroke-width:1.5;rx:8}
+      .boxtxt{fill:#e8edf4;font-family:sans-serif;font-size:13px;font-weight:600}
+      .boxsub{fill:#9fb0c3;font-family:sans-serif;font-size:10.5px}
+      .net{stroke:#76b900;stroke-width:2}
+      .fab{stroke:#4fc3f7;stroke-width:3}
+      .lbl{fill:#9fb0c3;font-family:sans-serif;font-size:11px}
+    </style>
+    <text x="450" y="24" text-anchor="middle" class="boxtxt" font-size="16">Cluster Anatomy</text>
+
+    <!-- Outside world -->
+    <rect x="20" y="45" width="120" height="50" class="box"/>
+    <text x="80" y="68" text-anchor="middle" class="boxtxt">You</text>
+    <text x="80" y="83" text-anchor="middle" class="boxsub">ssh client</text>
+
+    <!-- Login node -->
+    <rect x="200" y="45" width="140" height="50" class="box" stroke="#76b900"/>
+    <text x="270" y="68" text-anchor="middle" class="boxtxt">Login Node</text>
+    <text x="270" y="83" text-anchor="middle" class="boxsub">edit, compile, submit jobs</text>
+
+    <!-- Head/mgmt node -->
+    <rect x="380" y="45" width="160" height="50" class="box" stroke="#76b900"/>
+    <text x="460" y="68" text-anchor="middle" class="boxtxt">Head / Management Node</text>
+    <text x="460" y="83" text-anchor="middle" class="boxsub">BCM, scheduler control, DNS/DHCP</text>
+
+    <!-- Monitoring node -->
+    <rect x="580" y="45" width="150" height="50" class="box"/>
+    <text x="655" y="68" text-anchor="middle" class="boxtxt">Monitoring Node</text>
+    <text x="655" y="83" text-anchor="middle" class="boxsub">Prometheus, Grafana, DCGM exporter</text>
+
+    <line x1="140" y1="70" x2="200" y2="70" class="net"/>
+    <line x1="340" y1="70" x2="380" y2="70" class="net"/>
+    <line x1="540" y1="70" x2="580" y2="70" class="net"/>
+
+    <!-- Management network bar -->
+    <rect x="20" y="130" width="860" height="26" fill="#141c2b" stroke="#25324a"/>
+    <text x="450" y="148" text-anchor="middle" class="lbl">Management / Provisioning Network (1–25GbE) — PXE boot, config, monitoring, SSH</text>
+    <line x1="270" y1="95" x2="270" y2="130" class="net"/>
+    <line x1="460" y1="95" x2="460" y2="130" class="net"/>
+    <line x1="655" y1="95" x2="655" y2="130" class="net"/>
+
+    <!-- High speed fabric bar -->
+    <rect x="20" y="190" width="860" height="26" fill="#132029" stroke="#2a4a5a"/>
+    <text x="450" y="208" text-anchor="middle" class="lbl" fill="#4fc3f7">High-Speed Fabric (InfiniBand / RoCE) — GPU-to-GPU RDMA, MPI traffic</text>
+    <line x1="270" y1="156" x2="270" y2="190" class="net"/>
+    <line x1="460" y1="156" x2="460" y2="190" class="net"/>
+
+    <!-- Compute nodes -->
+    <rect x="60" y="250" width="130" height="55" class="box" stroke="#4fc3f7"/>
+    <text x="125" y="273" text-anchor="middle" class="boxtxt">Compute Node</text>
+    <text x="125" y="288" text-anchor="middle" class="boxsub">8x GPU + CPU + NICs</text>
+
+    <rect x="220" y="250" width="130" height="55" class="box" stroke="#4fc3f7"/>
+    <text x="285" y="273" text-anchor="middle" class="boxtxt">Compute Node</text>
+    <text x="285" y="288" text-anchor="middle" class="boxsub">8x GPU + CPU + NICs</text>
+
+    <rect x="380" y="250" width="130" height="55" class="box" stroke="#4fc3f7"/>
+    <text x="445" y="273" text-anchor="middle" class="boxtxt">Compute Node</text>
+    <text x="445" y="288" text-anchor="middle" class="boxsub">8x GPU + CPU + NICs</text>
+
+    <text x="540" y="280" text-anchor="middle" class="lbl" font-size="20">. . .</text>
+
+    <!-- Storage nodes -->
+    <rect x="620" y="250" width="130" height="55" class="box" stroke="#4fc3f7"/>
+    <text x="685" y="273" text-anchor="middle" class="boxtxt">Storage Node</text>
+    <text x="685" y="288" text-anchor="middle" class="boxsub">Lustre/GPFS OSS/OST</text>
+
+    <rect x="760" y="250" width="120" height="55" class="box" stroke="#4fc3f7"/>
+    <text x="820" y="273" text-anchor="middle" class="boxtxt">Storage Node</text>
+    <text x="820" y="288" text-anchor="middle" class="boxsub">NFS / metadata</text>
+
+    <line x1="125" y1="216" x2="125" y2="250" class="fab"/>
+    <line x1="285" y1="216" x2="285" y2="250" class="fab"/>
+    <line x1="445" y1="216" x2="445" y2="250" class="fab"/>
+    <line x1="685" y1="216" x2="685" y2="250" class="fab"/>
+    <line x1="820" y1="216" x2="820" y2="250" class="fab"/>
+
+    <text x="450" y="340" text-anchor="middle" class="lbl" font-size="12">
+      Users never touch compute nodes directly — they land on the login node, and the scheduler places their job on compute nodes.
+    </text>
+    <text x="450" y="360" text-anchor="middle" class="lbl" font-size="12">
+      Two separate networks exist on purpose: management traffic never competes with GPU-to-GPU training traffic.
+    </text>
+  </svg>
+
+  <h3>The Building Blocks, Explained</h3>
+  <table>
+    <tr><th>Component</th><th>Role</th></tr>
+    <tr>
+      <td><strong>Login node(s)</strong></td>
+      <td>The only machine(s) users SSH into directly. Used to edit code, compile, manage data, and
+      submit jobs to the scheduler. Deliberately <em>not</em> where heavy computation happens — a
+      runaway process here would degrade the experience for every user on the cluster.</td>
+    </tr>
+    <tr>
+      <td><strong>Head / management node</strong></td>
+      <td>Runs the cluster management software (e.g., NVIDIA Base Command Manager, xCAT, or
+      Warewulf), DHCP/PXE/DNS services for provisioning, and often the scheduler's control daemon.
+      In NVIDIA's DGX SuperPOD reference architecture this role is typically handled by a
+      redundant pair of head nodes for high availability.</td>
+    </tr>
+    <tr>
+      <td><strong>Compute nodes</strong></td>
+      <td>Where the actual work happens — CPUs, GPUs (often 8 per node in DGX-class systems),
+      local NVMe scratch, and high-speed network adapters. These are provisioned, not
+      hand-configured, so hundreds of them stay identical.</td>
+    </tr>
+    <tr>
+      <td><strong>Management network</strong></td>
+      <td>A standard Ethernet network (often 1GbE–25GbE) carrying provisioning traffic (PXE boot),
+      configuration management, monitoring metrics, and interactive SSH. Kept logically and often
+      physically separate from the high-speed fabric.</td>
+    </tr>
+    <tr>
+      <td><strong>High-speed fabric</strong></td>
+      <td>InfiniBand or RDMA-capable Ethernet (RoCE) connecting GPUs across nodes with
+      microsecond-scale latency. This is what lets a training job spread across 500 GPUs behave
+      like they're in one box. NVIDIA's DGX SuperPOD architectures separate this into distinct
+      compute and storage InfiniBand fabrics precisely so training traffic never contends with
+      storage I/O.</td>
+    </tr>
+    <tr>
+      <td><strong>Storage nodes</strong></td>
+      <td>Servers running a parallel filesystem (Lustre, GPFS/Spectrum Scale) or NFS, exporting a
+      shared namespace so any compute node can read/write the same files a job needs, regardless
+      of which physical node it lands on.</td>
+    </tr>
+  </table>
+
+  <div class="callout field">
+    <div class="label">Field note</div>
+    NVIDIA's DGX SuperPOD reference architectures typically dedicate five dual-socket x86 servers
+    to system management: two run as a redundant pair of Base Command Manager head nodes, and
+    three more host supporting services. The full design uses <em>four</em> distinct networks —
+    a compute (InfiniBand) fabric, a storage fabric, an in-band management/Ethernet network, and an
+    out-of-band (BMC/IPMI) management network — so that no single traffic type can starve another.
+  </div>
+
+  <h2>Who Does What</h2>
+  <div class="grid3">
+    <div class="card">
+      <h3>Cluster Admin</h3>
+      <p>Owns the physical and platform layers: racking, cabling, provisioning images, keeping
+      nodes healthy, patching the OS, managing the fabric and storage, and operating the
+      scheduler. Lives in layers 1–4 (and touches 5, 6, 8) of the stack.</p>
+    </div>
+    <div class="card">
+      <h3>HPC Engineer</h3>
+      <p>Bridges infrastructure and users: tunes the scheduler's fair-share policy, builds module
+      environments and container images, optimizes MPI/NCCL performance across the fabric, and
+      diagnoses why a job scales well on 8 nodes but falls apart on 80. Lives in layers 5–8.</p>
+    </div>
+    <div class="card">
+      <h3>User (Researcher/Engineer)</h3>
+      <p>Never touches provisioning or the fabric directly. Logs into the login node, loads a
+      module or container, writes a batch script, and submits it to the scheduler. Their entire
+      experience of "the cluster" is layers 6–8 of the stack.</p>
+    </div>
+  </div>
+
+  <h2>A Day in the Life: Submitting a Job</h2>
+  <p>
+    To make the stack concrete, here's what actually happens when a researcher — call her Priya —
+    runs a multi-GPU training job.
+  </p>
+  <div class="card">
+    <ol>
+      <li><strong>SSH in.</strong> Priya connects to <code>login01</code>. Her identity is checked
+      against LDAP/SSSD (layer 6) — the cluster doesn't have a local Unix account for her; it
+      trusts the central directory.</li>
+      <li><strong>Load the environment.</strong> She runs <code>module load pytorch/2.4</code> or
+      pulls a container image — the user environment layer (7) hands her a known-good, reproducible
+      software stack instead of "whatever happens to be installed."</li>
+      <li><strong>Write and submit a batch script.</strong> Something like
+      <code>sbatch --nodes=4 --gpus-per-node=8 train.sh</code>. This hands control to Slurm
+      (layer 5), which queues the request.</li>
+      <li><strong>The scheduler places the job.</strong> Slurm's control daemon
+      (<code>slurmctld</code>) checks which of the compute nodes are free, healthy, and topologically
+      close together on the fabric, then dispatches the job to per-node <code>slurmd</code> daemons
+      that actually launch it.</li>
+      <li><strong>The job runs across the fabric.</strong> PyTorch's distributed backend uses NCCL
+      over InfiniBand/RDMA (layer 2) so the 32 GPUs across 4 nodes synchronize gradients almost as
+      fast as if they were in one box. Checkpoints are written to the shared parallel filesystem
+      (layer 3), visible identically from every node.</li>
+      <li><strong>Priya watches it happen.</strong> Grafana dashboards fed by DCGM and Prometheus
+      (layer 8) show GPU utilization, temperature, and fabric throughput in near-real time, so
+      both Priya and the cluster admin can tell instantly if a GPU is idle, a node has fallen off
+      the fabric, or the job is I/O-bound.</li>
+      <li><strong>The job finishes; resources are freed.</strong> Slurm marks the nodes idle again,
+      ready for the next queued job — the whole cluster is a shared, time-multiplexed resource, not
+      dedicated hardware per user.</li>
+    </ol>
+  </div>
+  <div class="callout warn">
+    <div class="label">Common newcomer mistake</div>
+    Running compute directly on the login node ("it's just a quick test!"). Login nodes are shared
+    by every user on the cluster and are not sized for GPU or heavy CPU workloads — always submit
+    even small test jobs through the scheduler, ideally to an interactive/debug queue.
+  </div>
+
+  <h2>How This Guide Is Organized</h2>
+  <p>
+    Each remaining section goes deep on one layer of the stack, roughly bottom-to-top, with
+    provisioning covered as four alternative paths (pick the one matching your environment) before
+    everything comes together in a full build walkthrough.
+  </p>
+  <div class="toc">
+    <ol>
+      <li><a href="01-compute-hardware.html">Compute &amp; Hardware</a> — CPUs, GPUs, NVLink/NVSwitch</li>
+      <li><a href="02-networking-fabric.html">Networking &amp; Fabric</a> — InfiniBand, RoCE, RDMA, topology</li>
+      <li><a href="03-storage.html">Storage</a> — Lustre, GPFS/Spectrum Scale, NFS, BeeGFS</li>
+      <li><a href="04-provisioning-bcm.html">Provisioning with NVIDIA Base Command Manager (BCM)</a></li>
+      <li><a href="05-provisioning-xcat.html">Provisioning with xCAT</a></li>
+      <li><a href="06-provisioning-warewulf-openhpc.html">Provisioning with Warewulf + OpenHPC</a></li>
+      <li><a href="07-provisioning-baremetal-ansible.html">Roll-your-own bare-metal with Ansible + Slurm</a></li>
+      <li><a href="08-scheduling.html">Job Schedulers</a> — Slurm, PBS, LSF</li>
+      <li><a href="09-identity-ldap.html">LDAP Integration</a></li>
+      <li><a href="10-identity-sssd.html">SSSD Integration</a></li>
+      <li><a href="11-onboarding-dls.html">User Onboarding &amp; Distribution Lists</a></li>
+      <li><a href="12-monitoring.html">Monitoring &amp; Observability</a> — DCGM, Prometheus, Grafana</li>
+      <li><a href="13-end-to-end-build.html">Full End-to-End Build Walkthrough</a></li>
+    </ol>
+  </div>
+
+  <h2>Further Reading</h2>
+  <ul>
+    <li><a href="https://docs.nvidia.com/dgx-superpod/reference-architecture-scalable-infrastructure-b200/latest/network-fabrics.html" target="_blank" rel="noopener">NVIDIA DGX SuperPOD: Network Fabrics (B200 Reference Architecture)</a></li>
+    <li><a href="https://docs.nvidia.com/dgx-basepod/reference-architecture-infrastructure-foundation-enterprise-ai/latest/reference-architectures.html" target="_blank" rel="noopener">NVIDIA DGX BasePOD: Infrastructure Foundation for Enterprise AI — Reference Architecture</a></li>
+    <li><a href="https://docs.nvidia.com/base-command-manager/index.html" target="_blank" rel="noopener">NVIDIA Base Command Manager Documentation</a></li>
+    <li><a href="https://docs.nvidia.com/datacenter/dps/versions/latest/guides/concepts/base-command-manager/" target="_blank" rel="noopener">Base Command Manager — Concepts (NVIDIA Docs)</a></li>
+    <li><a href="https://docs.nvidia.com/mission-control/docs/systems-administration-guide/2.0.0/software-stack.html" target="_blank" rel="noopener">NVIDIA Mission Control Software Stack — Systems Administration Guide</a></li>
+    <li><a href="https://slurm.schedmd.com/overview.html" target="_blank" rel="noopener">Slurm Workload Manager — Overview (SchedMD)</a></li>
+    <li><a href="https://slurm.schedmd.com/documentation.html" target="_blank" rel="noopener">Slurm Workload Manager — Documentation</a></li>
+    <li><a href="https://www.jsspp.org/papers23/JSSPP_2023_keynote_SLURM.pdf" target="_blank" rel="noopener">Architecture of the Slurm Workload Manager (Jette &amp; Wickberg, JSSPP 2023)</a></li>
+    <li><a href="https://openhpc.community/" target="_blank" rel="noopener">OpenHPC Community</a></li>
+    <li><a href="https://www.top500.org/" target="_blank" rel="noopener">TOP500 — List of the World's Fastest Supercomputers</a></li>
+  </ul>
+
+  <div class="section-nav">
+    <span></span>
+    <a href="01-compute-hardware.html">Next: Compute &amp; Hardware →</a>
+  </div>
+</main>
+</div>
+
+<footer><div class="wrap">Part of the HPC Cluster Build Guide.</div></footer>
+</body>
+</html>

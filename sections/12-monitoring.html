@@ -1,0 +1,379 @@
+<!DOCTYPE html>
+<html data-theme="dark" lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>12 — Monitoring & Observability: DCGM, Prometheus, Grafana | HPC Cluster Build Guide</title>
+<link rel="stylesheet" href="../assets/css/style.css">
+</head>
+<body>
+<header class="top"><div class="wrap"><a href="../index.html">HPC Cluster Build Guide</a><span class="badge">Public Edition</span></div></header>
+<div class="wrap"><nav class="crumbs"><a href="11-onboarding-dls.html">← User Onboarding & DLs</a></nav>
+<main>
+
+<h1>12 — Monitoring & Observability: DCGM, Prometheus, Grafana</h1>
+<p class="lede">A cluster you can't see is a cluster you can't trust. This section covers how operators watch thousands of GPUs, fabrics, and nodes in real time — and how they find out about a failure before an angry researcher does.</p>
+
+<h2>Why observability matters at HPC scale</h2>
+<p>A single DGX or workstation is easy to babysit — you can just glance at <code>nvidia-smi</code>. A cluster with hundreds or thousands of GPU nodes is a different animal entirely. At that scale, failures aren't rare edge cases — they're a daily occurrence, and the job of a monitoring stack is to make them visible, attributable, and actionable before they silently waste GPU-hours.</p>
+<p>Here's what operators specifically need to see, continuously, across the whole fleet:</p>
+<div class="grid2">
+<div class="card">
+<h3>Health signals</h3>
+<ul>
+<li><strong>GPU utilization</strong> — are GPUs actually doing work, or idling while a job "runs"?</li>
+<li><strong>XID errors</strong> — the NVIDIA driver's error-code channel for GPU-level faults (ECC errors, Xid 79 "GPU fallen off the bus", Xid 63/64 row-remap events, etc.)</li>
+<li><strong>Thermal throttling</strong> — GPUs silently downclock when they overheat, tanking throughput without crashing anything</li>
+<li><strong>Fabric health</strong> — InfiniBand/RoCE link flaps, NVLink errors, NVSwitch faults</li>
+<li><strong>Node failures at scale</strong> — with 1,000+ nodes, something is always down; the question is whether you know about it in minutes or in a support ticket three days later</li>
+</ul>
+</div>
+<div class="card">
+<h3>Accounting signals</h3>
+<ul>
+<li><strong>Job-level GPU efficiency</strong> — is a Slurm job actually saturating its allocated GPUs, or paying for idle silicon?</li>
+<li><strong>Queue and scheduler health</strong> — pending job backlog, drained nodes, reservation conflicts</li>
+<li><strong>Capacity trends</strong> — utilization over weeks/months to justify (or defer) the next cluster expansion</li>
+<li><strong>Cost attribution</strong> — which team/project consumed which GPU-hours</li>
+</ul>
+</div>
+</div>
+<p>The pattern that has become the de facto standard for all of this — in HPC shops, hyperscalers, and NVIDIA's own MARS/DGX Cloud fleets alike — is: <strong>DCGM</strong> for GPU-native telemetry and health, <strong>Prometheus</strong> (plus a scalable remote-write backend) for metrics collection and storage, <strong>Grafana</strong> for dashboards, and <strong>Loki/ELK + Alertmanager</strong> for logs and paging. The rest of this section walks through each layer.</p>
+
+<h2>NVIDIA DCGM — Data Center GPU Manager</h2>
+<p><a href="https://docs.nvidia.com/datacenter/dcgm/latest/user-guide/index.html" target="_blank" rel="noopener">DCGM</a> is NVIDIA's purpose-built toolset for managing and monitoring NVIDIA GPUs in server and cluster environments. It runs as a background daemon (<code>nv-hostengine</code>) on every GPU node and exposes telemetry, diagnostics, and health monitoring through a CLI (<code>dcgmi</code>) and client libraries. Think of it as the layer that turns raw GPU hardware counters into something a monitoring system can consume.</p>
+
+<h3>dcgmi — the command-line interface</h3>
+<p>The <code>dcgmi</code> tool is what operators reach for when SSH'd onto a node to triage a problem interactively. A few of the commands you'll use constantly:</p>
+<pre><code># See a snapshot of all GPUs on this node
+dcgmi discovery -l
+
+# Set up a group of GPUs to watch, then check health
+dcgmi group -c gpu_group --default
+dcgmi health --set gpu_group -g pcie,mem,inforom,thermal,power,driver,nvlink
+dcgmi health --check -g gpu_group
+
+# Run the built-in active diagnostic suite (levels 1-4, level 3/4 stress the GPU)
+dcgmi diag -r 3 -g gpu_group
+
+# Dump live utilization / temperature / power metrics
+dcgmi dmon -e 203,204,150,155 -c 5
+</code></pre>
+<p>DCGM's <a href="https://docs.nvidia.com/datacenter/dcgm/latest/learn/modules/health-monitoring.html" target="_blank" rel="noopener">health monitoring module</a> can passively watch for problems across PCIe, GPU memory, InfoROM, the driver, thermal/power behavior, NVLink, NVSwitch, and even attached ConnectX NICs — flagging warning or critical severity per-component without interrupting running jobs. The active diagnostic (<code>dcgmi diag</code>) is the tool you run <em>between</em> jobs, during node draining, or as part of a pre-flight health gate before a node re-enters the scheduler pool — levels 3 and 4 actually load the GPU and can catch marginal hardware that passive monitoring misses.</p>
+
+<div class="callout warn">
+<div class="label">Common XID errors you will actually see</div>
+<table>
+<tr><th>XID</th><th>Meaning</th><th>Typical response</th></tr>
+<tr><td>13</td><td>Graphics engine exception (often a bad kernel/driver interaction)</td><td>Usually benign in isolation; watch for repeats</td></tr>
+<tr><td>31</td><td>GPU memory page fault</td><td>Often a user application bug; check the job's memory access pattern</td></tr>
+<tr><td>48</td><td>Double-bit ECC error (uncorrectable)</td><td>Flag GPU for row-remapping / RMA if recurring</td></tr>
+<tr><td>63 / 64</td><td>Row-remapping event pending / failure</td><td>Node needs a reset to apply the remap; recurring 64s mean the GPU is failing</td></tr>
+<tr><td>74</td><td>NVLink error</td><td>Check fabric/NVLink topology and cabling/seating</td></tr>
+<tr><td>79</td><td>GPU has fallen off the bus</td><td>Hardware failure — drain the node immediately, do not just reboot and hope</td></tr>
+<tr><td>94 / 95</td><td>Contained / uncontained ECC error</td><td>Uncontained (95) can crash other processes sharing the GPU — drain and investigate</td></tr>
+</table>
+<p>XID codes are logged to <code>dmesg</code>/<code>syslog</code> by the NVIDIA kernel driver. In a fleet monitoring stack, XID counts should always be scraped as a Prometheus metric and alerted on — a rising XID 79/95 rate is one of the highest-signal indicators of failing GPU hardware at scale.</p>
+</div>
+
+<h3>DCGM Exporter — bridging DCGM to Prometheus</h3>
+<p><a href="https://github.com/NVIDIA/dcgm-exporter" target="_blank" rel="noopener">dcgm-exporter</a> is NVIDIA's official Prometheus exporter built on top of DCGM's Go bindings. It runs as a lightweight daemon (typically one per GPU node, deployed as a Kubernetes DaemonSet via the <a href="https://github.com/NVIDIA/gpu-operator" target="_blank" rel="noopener">GPU Operator</a>, or as a systemd service on bare-metal Slurm nodes) and exposes an HTTP <code>/metrics</code> endpoint that Prometheus scrapes on a regular interval. It reports GPU utilization, memory utilization, temperature, power draw, SM clock, PCIe throughput, NVLink bandwidth/errors, XID error counts, ECC error counts, and — critically for job accounting — can label each metric with the Slurm/Kubernetes job ID that owns the GPU at scrape time, letting you build "GPU efficiency per job" dashboards directly from raw exporter data.</p>
+
+<h2>Prometheus architecture for cluster monitoring</h2>
+<p>Prometheus is a pull-based metrics system: it doesn't wait for nodes to push data at it, it goes and scrapes each node's <code>/metrics</code> HTTP endpoint on a schedule (typically every 15-30 seconds for GPU metrics). Every node runs one or more small "exporter" processes whose only job is to translate local state into Prometheus's text metrics format.</p>
+<div class="grid3">
+<div class="card"><h3>node_exporter</h3><p>General Linux host metrics: CPU, memory, disk, filesystem, network interface counters. The baseline exporter on every node in the fleet, GPU or not.</p></div>
+<div class="card"><h3>dcgm-exporter</h3><p>GPU-specific telemetry from DCGM, as described above. Runs only on GPU nodes.</p></div>
+<div class="card"><h3>Fabric / IB exporters</h3><p>InfiniBand port counters (via <code>ibstat</code>/perfquery-based exporters) or switch-side SNMP exporters for RoCE fabrics — surfaces link flaps, CRC errors, and symbol errors before they become job failures.</p></div>
+</div>
+
+<h3>The scale problem — and why remote_write exists</h3>
+<p>A single Prometheus server works fine for a small cluster, but it has two structural limits at HPC scale: it's a single point of failure, and its local TSDB (time-series database) is not built to retain years of high-cardinality GPU metrics from thousands of nodes efficiently. The standard fix is to keep Prometheus doing what it's good at — scraping and short-term local storage (hours to a couple of weeks) — and configure <code>remote_write</code> to continuously ship samples to a horizontally scalable, multi-tenant backend for long-term storage and global querying. The three common choices are <a href="https://grafana.com/oss/mimir/" target="_blank" rel="noopener">Grafana Mimir</a> (the actively developed successor to Cortex, object-storage-backed), <a href="https://thanos.io/" target="_blank" rel="noopener">Thanos</a> (sidecar/receiver architecture also backed by S3/GCS-style object storage), and Cortex (largely superseded by Mimir today — most teams migrating off Cortex land on Mimir). All three speak the same remote-write protocol and give you a single global PromQL endpoint across every cluster in your fleet, which is what lets a Grafana dashboard show utilization across five geographically separate clusters at once.</p>
+
+<h3>Example scrape config and dcgm-exporter deployment</h3>
+<pre><code># prometheus.yml — scrape both node and GPU exporters, remote_write to Mimir
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: 'node_exporter'
+    static_configs:
+      - targets: ['gpu-node-001:9100', 'gpu-node-002:9100']
+        labels:
+          cluster: 'oci-nrt-cs-001'
+
+  - job_name: 'dcgm_exporter'
+    scrape_interval: 15s
+    static_configs:
+      - targets: ['gpu-node-001:9400', 'gpu-node-002:9400']
+        labels:
+          cluster: 'oci-nrt-cs-001'
+    metric_relabel_configs:
+      # keep GPU UUID + Slurm job id labels, drop noisy internal DCGM fields
+      - source_labels: [__name__]
+        regex: 'DCGM_FI_DEV_(GPU_UTIL|MEM_COPY_UTIL|GPU_TEMP|POWER_USAGE|XID_ERRORS|ECC_SBE_VOL_TOTAL|ECC_DBE_VOL_TOTAL|NVLINK_CRC_DATA_ERROR_COUNT_TOTAL)'
+        action: keep
+
+remote_write:
+  - url: "https://mimir.internal.example.com/api/v1/push"
+    queue_config:
+      max_samples_per_send: 5000
+      max_shards: 30
+    tls_config:
+      ca_file: /etc/prometheus/certs/ca.pem
+</code></pre>
+<pre><code># dcgm-exporter — quickest path: standalone container on a GPU node
+docker run -d --restart=always --gpus all \
+  --cap-add SYS_ADMIN \
+  -p 9400:9400 \
+  nvcr.io/nvidia/k8s/dcgm-exporter:3.3.9-3.6.1-ubuntu22.04
+
+# curl its metrics endpoint directly to sanity-check before wiring Prometheus
+curl -s localhost:9400/metrics | grep DCGM_FI_DEV_GPU_UTIL
+</code></pre>
+
+<h2>Monitoring pipeline, end to end</h2>
+<svg class="diagram" viewBox="0 0 900 400" xmlns="http://www.w3.org/2000/svg">
+  <style>
+    .box{fill:#1a2437;stroke:#25324a;stroke-width:1.5}
+    .accent{fill:#141c2b;stroke:#76b900;stroke-width:2}
+    .accent2{fill:#141c2b;stroke:#4fc3f7;stroke-width:2}
+    .lbl{fill:#e8edf4;font-family:sans-serif;font-size:13px;text-anchor:middle}
+    .sub{fill:#9fb0c3;font-family:sans-serif;font-size:11px;text-anchor:middle}
+    .arrow{stroke:#4fc3f7;stroke-width:2;fill:none;marker-end:url(#arrowhead)}
+  </style>
+  <defs>
+    <marker id="arrowhead" markerWidth="10" markerHeight="8" refX="8" refY="4" orient="auto">
+      <polygon points="0 0, 10 4, 0 8" fill="#4fc3f7"/>
+    </marker>
+  </defs>
+
+  <rect x="20" y="40" width="150" height="60" rx="8" class="box"/>
+  <text x="95" y="65" class="lbl">GPU Node</text>
+  <text x="95" y="83" class="sub">dcgm-exporter :9400</text>
+
+  <rect x="20" y="120" width="150" height="60" rx="8" class="box"/>
+  <text x="95" y="145" class="lbl">GPU Node</text>
+  <text x="95" y="163" class="sub">node_exporter :9100</text>
+
+  <rect x="20" y="200" width="150" height="60" rx="8" class="box"/>
+  <text x="95" y="225" class="lbl">IB / RoCE Switch</text>
+  <text x="95" y="243" class="sub">fabric exporter</text>
+
+  <rect x="220" y="120" width="150" height="80" rx="8" class="accent"/>
+  <text x="295" y="150" class="lbl">Prometheus</text>
+  <text x="295" y="168" class="sub">scrape every 15s</text>
+  <text x="295" y="184" class="sub">local TSDB (short-term)</text>
+
+  <line x1="170" y1="70" x2="220" y2="145" class="arrow"/>
+  <line x1="170" y1="150" x2="220" y2="155" class="arrow"/>
+  <line x1="170" y1="230" x2="220" y2="165" class="arrow"/>
+
+  <rect x="420" y="60" width="160" height="60" rx="8" class="accent2"/>
+  <text x="500" y="85" class="lbl">Mimir / Thanos</text>
+  <text x="500" y="103" class="sub">remote_write, long-term</text>
+
+  <line x1="370" y1="140" x2="420" y2="95" class="arrow"/>
+
+  <rect x="420" y="180" width="160" height="60" rx="8" class="accent2"/>
+  <text x="500" y="205" class="lbl">Alertmanager</text>
+  <text x="500" y="223" class="sub">node-down, XID, thermal</text>
+
+  <line x1="370" y1="170" x2="420" y2="205" class="arrow"/>
+
+  <rect x="640" y="60" width="160" height="60" rx="8" class="accent"/>
+  <text x="720" y="85" class="lbl">Grafana</text>
+  <text x="720" y="103" class="sub">dashboards</text>
+
+  <line x1="580" y1="90" x2="640" y2="90" class="arrow"/>
+
+  <rect x="640" y="180" width="160" height="60" rx="8" class="box"/>
+  <text x="720" y="205" class="lbl">PagerDuty</text>
+  <text x="720" y="223" class="sub">on-call paging</text>
+
+  <line x1="580" y1="210" x2="640" y2="210" class="arrow"/>
+
+  <rect x="20" y="300" width="330" height="80" rx="8" class="box"/>
+  <text x="185" y="325" class="lbl">syslog / dmesg / slurmctld logs</text>
+  <text x="185" y="343" class="sub">Promtail / Filebeat agents</text>
+  <line x1="185" y1="300" x2="185" y2="260" class="arrow"/>
+
+  <rect x="420" y="300" width="160" height="80" rx="8" class="accent2"/>
+  <text x="500" y="330" class="lbl">Loki / ELK</text>
+  <text x="500" y="348" class="sub">centralized logs</text>
+  <line x1="350" y1="340" x2="420" y2="340" class="arrow"/>
+
+  <line x1="580" y1="330" x2="720" y2="240" class="arrow"/>
+  <text x="655" y="290" class="sub">explored in Grafana</text>
+</svg>
+<p>Every node runs small exporter agents; Prometheus pulls their metrics on a schedule and forwards them to a long-term backend via <code>remote_write</code>; Grafana queries that backend for dashboards; Alertmanager evaluates rules against the same data and routes pages to PagerDuty; and a separate log pipeline (Promtail/Filebeat → Loki/ELK) handles unstructured text logs that never fit Prometheus's numeric time-series model.</p>
+
+<h2>Grafana dashboards</h2>
+<p><a href="https://grafana.com/docs/grafana/latest/" target="_blank" rel="noopener">Grafana</a> is the visualization layer that operators and end users actually look at. A production HPC monitoring stack typically ships several purpose-built dashboards rather than one giant one:</p>
+<div class="grid2">
+<div class="card">
+<h3>Fleet health dashboard</h3>
+<p>GPU utilization heatmap across every node/GPU in the cluster (see mockup below), aggregate XID error counts over the last 24h, count of nodes currently drained vs. healthy, thermal throttling events, and NVLink/fabric error rates. This is the "is anything on fire right now" view.</p>
+</div>
+<div class="card">
+<h3>Job efficiency dashboard</h3>
+<p>Per-job GPU utilization and memory-bandwidth utilization over the job's lifetime, joined against Slurm job ID labels from dcgm-exporter. Lets a user (or their manager) see instantly whether a multi-day training job is actually using the GPUs it reserved, or leaving them idle waiting on I/O.</p>
+</div>
+</div>
+<p>Typical panels: a heatmap panel for per-GPU utilization across the fleet, a time-series panel for XID error rate (alert threshold overlaid), a stat panel for "nodes currently unhealthy," a bar gauge for fabric link error counts per switch, and a table panel joining job ID → owning team → GPU-hours consumed for cost attribution.</p>
+
+<h3>Example: GPU utilization heatmap mockup</h3>
+<svg class="diagram" viewBox="0 0 900 400" xmlns="http://www.w3.org/2000/svg">
+  <style>
+    .hlbl{fill:#e8edf4;font-family:sans-serif;font-size:12px}
+    .hsub{fill:#9fb0c3;font-family:sans-serif;font-size:11px}
+    .axis{fill:#9fb0c3;font-family:monospace;font-size:10px;text-anchor:end}
+  </style>
+  <text x="20" y="24" class="hlbl" font-size="15">GPU Utilization Heatmap — 16 nodes × 8 GPUs (last 5 min avg)</text>
+  <!-- legend -->
+  <text x="700" y="24" class="hsub">0%</text>
+  <rect x="720" y="12" width="14" height="14" fill="#26324a"/>
+  <rect x="738" y="12" width="14" height="14" fill="#2e5aa8"/>
+  <rect x="756" y="12" width="14" height="14" fill="#4fc3f7"/>
+  <rect x="774" y="12" width="14" height="14" fill="#76b900"/>
+  <rect x="792" y="12" width="14" height="14" fill="#ffb74d"/>
+  <rect x="810" y="12" width="14" height="14" fill="#ff6b6b"/>
+  <text x="835" y="24" class="hsub">idle/hot</text>
+
+  <!-- 16 rows (nodes) x 8 cols (gpus), cell 48x18, start y=45 -->
+  <g font-family="monospace">
+    <!-- generate deterministic pseudo-random-looking utilization pattern -->
+    <!-- Row labels -->
+    <text x="70" y="58" class="axis">node-001</text>
+    <text x="70" y="78" class="axis">node-002</text>
+    <text x="70" y="98" class="axis">node-003</text>
+    <text x="70" y="118" class="axis">node-004</text>
+    <text x="70" y="138" class="axis">node-005</text>
+    <text x="70" y="158" class="axis">node-006</text>
+    <text x="70" y="178" class="axis">node-007</text>
+    <text x="70" y="198" class="axis">node-008</text>
+    <text x="70" y="218" class="axis">node-009</text>
+    <text x="70" y="238" class="axis">node-010</text>
+    <text x="70" y="258" class="axis">node-011</text>
+    <text x="70" y="278" class="axis">node-012</text>
+    <text x="70" y="298" class="axis">node-013</text>
+    <text x="70" y="318" class="axis">node-014</text>
+    <text x="70" y="338" class="axis">node-015</text>
+    <text x="70" y="358" class="axis">node-016 (drained)</text>
+
+    <!-- column headers gpu0..gpu7 -->
+    <text x="105" y="42" class="hsub">g0</text>
+    <text x="153" y="42" class="hsub">g1</text>
+    <text x="201" y="42" class="hsub">g2</text>
+    <text x="249" y="42" class="hsub">g3</text>
+    <text x="297" y="42" class="hsub">g4</text>
+    <text x="345" y="42" class="hsub">g5</text>
+    <text x="393" y="42" class="hsub">g6</text>
+    <text x="441" y="42" class="hsub">g7</text>
+  </g>
+
+  <!-- cells: rows y = 45 + row*20, cols x = 80 + col*48 -->
+  <g stroke="#0b0f14" stroke-width="1">
+    <!-- Row 1: mostly busy, one hot -->
+    <rect x="80" y="46" width="46" height="16" fill="#76b900"/><rect x="128" y="46" width="46" height="16" fill="#76b900"/><rect x="176" y="46" width="46" height="16" fill="#4fc3f7"/><rect x="224" y="46" width="46" height="16" fill="#76b900"/><rect x="272" y="46" width="46" height="16" fill="#ff6b6b"/><rect x="320" y="46" width="46" height="16" fill="#76b900"/><rect x="368" y="46" width="46" height="16" fill="#4fc3f7"/><rect x="416" y="46" width="46" height="16" fill="#76b900"/>
+    <!-- Row 2 -->
+    <rect x="80" y="66" width="46" height="16" fill="#76b900"/><rect x="128" y="66" width="46" height="16" fill="#76b900"/><rect x="176" y="66" width="46" height="16" fill="#76b900"/><rect x="224" y="66" width="46" height="16" fill="#76b900"/><rect x="272" y="66" width="46" height="16" fill="#76b900"/><rect x="320" y="66" width="46" height="16" fill="#4fc3f7"/><rect x="368" y="66" width="46" height="16" fill="#76b900"/><rect x="416" y="66" width="46" height="16" fill="#76b900"/>
+    <!-- Row 3: idle patch -->
+    <rect x="80" y="86" width="46" height="16" fill="#2e5aa8"/><rect x="128" y="86" width="46" height="16" fill="#2e5aa8"/><rect x="176" y="86" width="46" height="16" fill="#26324a"/><rect x="224" y="86" width="46" height="16" fill="#26324a"/><rect x="272" y="86" width="46" height="16" fill="#2e5aa8"/><rect x="320" y="86" width="46" height="16" fill="#2e5aa8"/><rect x="368" y="86" width="46" height="16" fill="#4fc3f7"/><rect x="416" y="86" width="46" height="16" fill="#4fc3f7"/>
+    <!-- Row 4 -->
+    <rect x="80" y="106" width="46" height="16" fill="#76b900"/><rect x="128" y="106" width="46" height="16" fill="#76b900"/><rect x="176" y="106" width="46" height="16" fill="#76b900"/><rect x="224" y="106" width="46" height="16" fill="#76b900"/><rect x="272" y="106" width="46" height="16" fill="#76b900"/><rect x="320" y="106" width="46" height="16" fill="#76b900"/><rect x="368" y="106" width="46" height="16" fill="#76b900"/><rect x="416" y="106" width="46" height="16" fill="#76b900"/>
+    <!-- Row 5 -->
+    <rect x="80" y="126" width="46" height="16" fill="#4fc3f7"/><rect x="128" y="126" width="46" height="16" fill="#4fc3f7"/><rect x="176" y="126" width="46" height="16" fill="#76b900"/><rect x="224" y="126" width="46" height="16" fill="#76b900"/><rect x="272" y="126" width="46" height="16" fill="#4fc3f7"/><rect x="320" y="126" width="46" height="16" fill="#76b900"/><rect x="368" y="126" width="46" height="16" fill="#76b900"/><rect x="416" y="126" width="46" height="16" fill="#4fc3f7"/>
+    <!-- Row 6 -->
+    <rect x="80" y="146" width="46" height="16" fill="#76b900"/><rect x="128" y="146" width="46" height="16" fill="#76b900"/><rect x="176" y="146" width="46" height="16" fill="#76b900"/><rect x="224" y="146" width="46" height="16" fill="#ffb74d"/><rect x="272" y="146" width="46" height="16" fill="#76b900"/><rect x="320" y="146" width="46" height="16" fill="#76b900"/><rect x="368" y="146" width="46" height="16" fill="#76b900"/><rect x="416" y="146" width="46" height="16" fill="#76b900"/>
+    <!-- Row 7 -->
+    <rect x="80" y="166" width="46" height="16" fill="#76b900"/><rect x="128" y="166" width="46" height="16" fill="#4fc3f7"/><rect x="176" y="166" width="46" height="16" fill="#76b900"/><rect x="224" y="166" width="46" height="16" fill="#76b900"/><rect x="272" y="166" width="46" height="16" fill="#76b900"/><rect x="320" y="166" width="46" height="16" fill="#4fc3f7"/><rect x="368" y="166" width="46" height="16" fill="#76b900"/><rect x="416" y="166" width="46" height="16" fill="#76b900"/>
+    <!-- Row 8 -->
+    <rect x="80" y="186" width="46" height="16" fill="#76b900"/><rect x="128" y="186" width="46" height="16" fill="#76b900"/><rect x="176" y="186" width="46" height="16" fill="#76b900"/><rect x="224" y="186" width="46" height="16" fill="#76b900"/><rect x="272" y="186" width="46" height="16" fill="#76b900"/><rect x="320" y="186" width="46" height="16" fill="#76b900"/><rect x="368" y="186" width="46" height="16" fill="#76b900"/><rect x="416" y="186" width="46" height="16" fill="#76b900"/>
+    <!-- Row 9 -->
+    <rect x="80" y="206" width="46" height="16" fill="#4fc3f7"/><rect x="128" y="206" width="46" height="16" fill="#4fc3f7"/><rect x="176" y="206" width="46" height="16" fill="#4fc3f7"/><rect x="224" y="206" width="46" height="16" fill="#4fc3f7"/><rect x="272" y="206" width="46" height="16" fill="#4fc3f7"/><rect x="320" y="206" width="46" height="16" fill="#4fc3f7"/><rect x="368" y="206" width="46" height="16" fill="#4fc3f7"/><rect x="416" y="206" width="46" height="16" fill="#4fc3f7"/>
+    <!-- Row 10 -->
+    <rect x="80" y="226" width="46" height="16" fill="#76b900"/><rect x="128" y="226" width="46" height="16" fill="#76b900"/><rect x="176" y="226" width="46" height="16" fill="#76b900"/><rect x="224" y="226" width="46" height="16" fill="#76b900"/><rect x="272" y="226" width="46" height="16" fill="#76b900"/><rect x="320" y="226" width="46" height="16" fill="#76b900"/><rect x="368" y="226" width="46" height="16" fill="#76b900"/><rect x="416" y="226" width="46" height="16" fill="#76b900"/>
+    <!-- Row 11 -->
+    <rect x="80" y="246" width="46" height="16" fill="#76b900"/><rect x="128" y="246" width="46" height="16" fill="#76b900"/><rect x="176" y="246" width="46" height="16" fill="#ff6b6b"/><rect x="224" y="246" width="46" height="16" fill="#76b900"/><rect x="272" y="246" width="46" height="16" fill="#76b900"/><rect x="320" y="246" width="46" height="16" fill="#76b900"/><rect x="368" y="246" width="46" height="16" fill="#76b900"/><rect x="416" y="246" width="46" height="16" fill="#76b900"/>
+    <!-- Row 12 -->
+    <rect x="80" y="266" width="46" height="16" fill="#76b900"/><rect x="128" y="266" width="46" height="16" fill="#76b900"/><rect x="176" y="266" width="46" height="16" fill="#76b900"/><rect x="224" y="266" width="46" height="16" fill="#76b900"/><rect x="272" y="266" width="46" height="16" fill="#76b900"/><rect x="320" y="266" width="46" height="16" fill="#76b900"/><rect x="368" y="266" width="46" height="16" fill="#76b900"/><rect x="416" y="266" width="46" height="16" fill="#76b900"/>
+    <!-- Row 13 -->
+    <rect x="80" y="286" width="46" height="16" fill="#4fc3f7"/><rect x="128" y="286" width="46" height="16" fill="#76b900"/><rect x="176" y="286" width="46" height="16" fill="#76b900"/><rect x="224" y="286" width="46" height="16" fill="#4fc3f7"/><rect x="272" y="286" width="46" height="16" fill="#76b900"/><rect x="320" y="286" width="46" height="16" fill="#76b900"/><rect x="368" y="286" width="46" height="16" fill="#76b900"/><rect x="416" y="286" width="46" height="16" fill="#4fc3f7"/>
+    <!-- Row 14 -->
+    <rect x="80" y="306" width="46" height="16" fill="#76b900"/><rect x="128" y="306" width="46" height="16" fill="#76b900"/><rect x="176" y="306" width="46" height="16" fill="#76b900"/><rect x="224" y="306" width="46" height="16" fill="#76b900"/><rect x="272" y="306" width="46" height="16" fill="#76b900"/><rect x="320" y="306" width="46" height="16" fill="#76b900"/><rect x="368" y="306" width="46" height="16" fill="#76b900"/><rect x="416" y="306" width="46" height="16" fill="#76b900"/>
+    <!-- Row 15 -->
+    <rect x="80" y="326" width="46" height="16" fill="#76b900"/><rect x="128" y="326" width="46" height="16" fill="#4fc3f7"/><rect x="176" y="326" width="46" height="16" fill="#76b900"/><rect x="224" y="326" width="46" height="16" fill="#76b900"/><rect x="272" y="326" width="46" height="16" fill="#76b900"/><rect x="320" y="326" width="46" height="16" fill="#76b900"/><rect x="368" y="326" width="46" height="16" fill="#76b900"/><rect x="416" y="326" width="46" height="16" fill="#76b900"/>
+    <!-- Row 16: drained node, all offline -->
+    <rect x="80" y="346" width="46" height="16" fill="#25324a"/><rect x="128" y="346" width="46" height="16" fill="#25324a"/><rect x="176" y="346" width="46" height="16" fill="#25324a"/><rect x="224" y="346" width="46" height="16" fill="#25324a"/><rect x="272" y="346" width="46" height="16" fill="#25324a"/><rect x="320" y="346" width="46" height="16" fill="#25324a"/><rect x="368" y="346" width="46" height="16" fill="#25324a"/><rect x="416" y="346" width="46" height="16" fill="#25324a"/>
+  </g>
+  <text x="480" y="200" class="hsub" transform="rotate(0)"> </text>
+  <text x="500" y="120" class="hlbl">← green cells = GPUs at high utilization (healthy training job)</text>
+  <text x="500" y="145" class="hlbl">← red cell (node-011, g2) = XID error / thermal event, drill in</text>
+  <text x="500" y="360" class="hlbl">← gray row = node-016 currently drained for maintenance</text>
+</svg>
+
+<h2>Log aggregation basics</h2>
+<p>Prometheus metrics tell you <em>that</em> something is wrong (a number crossed a threshold); logs tell you <em>why</em>. Every node produces unstructured text — kernel messages (<code>dmesg</code>, which is where XID errors actually get written by the NVIDIA driver), <code>syslog</code>, and scheduler daemon logs like <code>slurmctld.log</code>/<code>slurmd.log</code> — and at fleet scale you need those centralized and searchable, not scattered across thousands of individual node filesystems.</p>
+<p>Two common approaches:</p>
+<div class="grid2">
+<div class="card">
+<h3>Grafana Loki</h3>
+<p>Indexes only metadata labels (node, cluster, service) rather than full text, keeping storage costs low. Pairs naturally with Grafana and Prometheus since it uses the same label model and query ergonomics (LogQL mirrors PromQL). <strong>Promtail</strong> or the newer <strong>Grafana Alloy</strong> agent tails log files on each node and ships them to Loki. This is the lighter-weight, more Prometheus-native option and the common default in NVIDIA-style GPU cluster stacks.</p>
+</div>
+<div class="card">
+<h3>ELK / OpenSearch</h3>
+<p>Elasticsearch (or OpenSearch) + Logstash/Filebeat + Kibana — full-text indexing of every log line, more powerful ad-hoc search and richer query DSL, but heavier on storage and compute. A better fit when logs need to support security/audit investigations or complex text search beyond label filtering.</p>
+</div>
+</div>
+<p>Either way, the goal is the same: when Alertmanager fires "node-011 GPU 2 XID 79," the very next click should take an operator straight to that node's correlated <code>dmesg</code> output around the same timestamp — without SSH'ing in.</p>
+
+<h2>Alerting basics</h2>
+<p><a href="https://prometheus.io/docs/alerting/latest/alertmanager/" target="_blank" rel="noopener">Alertmanager</a> is Prometheus's companion component for turning firing alert rules into notifications. Prometheus itself evaluates alerting rules (PromQL expressions with thresholds) on a schedule; when a rule's condition is true, it hands the alert to Alertmanager, which handles deduplication, grouping, silencing, and routing to the right notification channel — commonly PagerDuty for anything that needs a human paged at 3 a.m., and Slack for lower-severity/informational alerts.</p>
+<pre><code># alertmanager rule examples (Prometheus rules.yml)
+groups:
+  - name: gpu-health
+    rules:
+      - alert: NodeDown
+        expr: up{job="node_exporter"} == 0
+        for: 2m
+        labels: {severity: critical}
+        annotations:
+          summary: "{{ $labels.instance }} is unreachable"
+
+      - alert: GPUFallenOffBus
+        expr: increase(DCGM_FI_DEV_XID_ERRORS{xid="79"}[5m]) > 0
+        labels: {severity: critical}
+        annotations:
+          summary: "XID 79 on {{ $labels.gpu }} at {{ $labels.instance }} — drain node"
+
+      - alert: GPUThermalThrottle
+        expr: DCGM_FI_DEV_GPU_TEMP > 85
+        for: 10m
+        labels: {severity: warning}
+        annotations:
+          summary: "{{ $labels.instance }} GPU {{ $labels.gpu }} sustained > 85C"
+</code></pre>
+<p>Routing these into <strong>PagerDuty</strong> is typically a matter of configuring an Alertmanager receiver with a PagerDuty integration key per severity tier — critical alerts (node down, XID 79/95, fabric fully down) page the on-call engineer immediately, while warnings (thermal creep, minor XID counts, single-link fabric degradation) route to a Slack channel for daytime triage instead of an interrupt at 2 a.m.</p>
+
+<h2>Further Reading</h2>
+<ul>
+<li><a href="https://docs.nvidia.com/datacenter/dcgm/latest/user-guide/index.html" target="_blank" rel="noopener">NVIDIA DCGM User Guide</a> — docs.nvidia.com/datacenter/dcgm</li>
+<li><a href="https://docs.nvidia.com/datacenter/dcgm/latest/learn/modules/health-monitoring.html" target="_blank" rel="noopener">DCGM Health Monitoring module documentation</a></li>
+<li><a href="https://github.com/NVIDIA/DCGM" target="_blank" rel="noopener">NVIDIA/DCGM on GitHub</a></li>
+<li><a href="https://github.com/NVIDIA/dcgm-exporter" target="_blank" rel="noopener">NVIDIA/dcgm-exporter on GitHub</a></li>
+<li><a href="https://docs.nvidia.com/datacenter/cloud-native/gpu-telemetry/latest/dcgm-exporter.html" target="_blank" rel="noopener">DCGM Exporter — NVIDIA GPU Telemetry docs</a></li>
+<li><a href="https://prometheus.io/docs/introduction/overview/" target="_blank" rel="noopener">Prometheus documentation</a></li>
+<li><a href="https://prometheus.io/docs/alerting/latest/alertmanager/" target="_blank" rel="noopener">Prometheus Alertmanager documentation</a></li>
+<li><a href="https://grafana.com/docs/grafana/latest/" target="_blank" rel="noopener">Grafana documentation</a></li>
+<li><a href="https://grafana.com/docs/loki/latest/" target="_blank" rel="noopener">Grafana Loki documentation</a></li>
+<li><a href="https://grafana.com/oss/mimir/" target="_blank" rel="noopener">Grafana Mimir overview</a></li>
+<li><a href="https://thanos.io/" target="_blank" rel="noopener">Thanos — highly available Prometheus setup</a></li>
+</ul>
+
+<div class="section-nav"><a href="11-onboarding-dls.html">← User Onboarding & DLs</a><a href="13-end-to-end-build.html">Next: Full Build Walkthrough →</a></div>
+</main></div>
+<footer><div class="wrap">Part of the HPC Cluster Build Guide.</div></footer>
+</body>
+</html>

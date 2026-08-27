@@ -1,0 +1,229 @@
+<!DOCTYPE html>
+<html data-theme="dark">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Storage: Parallel Filesystems and Data Tiers — HPC Cluster Build Guide</title>
+<link rel="stylesheet" href="../assets/css/style.css">
+</head>
+<body>
+<header class="top"><div class="wrap"><a href="../index.html">HPC Cluster Build Guide</a><span class="badge">Public Edition</span></div></header>
+<div class="wrap">
+<nav class="crumbs"><a href="02-networking-fabric.html">← Networking &amp; Fabric</a></nav>
+<main>
+
+<h1>03 — Storage: Parallel Filesystems and Data Tiers</h1>
+<p class="lede">A GPU cluster is only as fast as the data it can feed its GPUs. Once you've built a fast network fabric (see the previous section), the next bottleneck is almost always storage — specifically, how fast thousands of compute nodes can read, write, and checkpoint data at once without stepping on each other. This section explains why ordinary file servers fall over at HPC scale, how the major parallel filesystems solve that problem, and how to think about sizing storage for an AI training cluster.</p>
+
+<h2>Why a single file server isn't enough</h2>
+<div class="card">
+<p>Imagine a normal office file share: one server, one disk array, one network port, serving files to a few dozen laptops. That's roughly what <strong>NFS</strong> (Network File System) does, and it works fine at that scale. Now imagine 2,048 GPU nodes, each with 8 GPUs, all trying to read training data or write a multi-terabyte model checkpoint at the same moment. A single NFS server has one CPU, one set of disks, and one network link — it becomes a hard ceiling on throughput almost immediately, and every client queues up behind it.</p>
+<p>HPC and AI clusters solve this with <strong>parallel filesystems</strong>: instead of one server owning all the data, the filesystem spreads both metadata (file names, permissions, directory structure) and file data across many independent servers and disks. A client can then talk to dozens or hundreds of servers <em>simultaneously</em>, so aggregate bandwidth and IOPS (I/O operations per second) scale roughly with the number of servers you add — not with the speed of any single machine.</p>
+</div>
+
+<div class="callout tip">
+<div class="label">Layman analogy</div>
+A single-server NFS share is like one checkout lane at a grocery store — everyone waits in one line no matter how many customers show up. A parallel filesystem is like opening 50 checkout lanes at once and telling each customer which lane has their items pre-sorted. The store (cluster) can now serve far more customers (nodes) per minute.
+</div>
+
+<h2>Lustre: the HPC standard</h2>
+<p>Lustre is the most widely deployed parallel filesystem in traditional HPC (and increasingly in AI training clusters). It splits its job into distinct roles:</p>
+
+<div class="grid2">
+<div class="card">
+<h3>Metadata side</h3>
+<ul>
+<li><strong>MGS</strong> (Management Server) — holds cluster-wide configuration.</li>
+<li><strong>MDS</strong> (Metadata Server) — the node(s) that handle namespace operations: file/directory creation, permissions, "where are this file's chunks?"</li>
+<li><strong>MDT</strong> (Metadata Target) — the actual storage device (usually fast NVMe/SSD) backing an MDS, holding file names, directory trees, and layout pointers.</li>
+</ul>
+</div>
+<div class="card">
+<h3>Data side</h3>
+<ul>
+<li><strong>OSS</strong> (Object Storage Server) — the node(s) that actually move file data.</li>
+<li><strong>OST</strong> (Object Storage Target) — the disk array behind an OSS where file content objects physically live.</li>
+<li><strong>Client</strong> — runs on every compute node; talks to the MDS once to learn a file's layout, then talks directly and in parallel to every OSS that holds a piece of that file.</li>
+</ul>
+</div>
+</div>
+
+<p>The key trick is <strong>striping</strong>: a large file isn't stored whole on one OST — it's chopped into stripes and spread across many OSTs. When a client reads that file, it pulls stripes from many OSS nodes at once, so a single file's read speed can exceed what any one server or disk could deliver alone. A Lustre filesystem typically has one (or a few) MDS but many OSS nodes — the OSS/OST layer is where you buy bandwidth by adding servers.</p>
+
+<svg class="diagram" viewBox="0 0 900 400" role="img" aria-label="Lustre architecture diagram showing clients connecting to an MDS with MDT and multiple OSS nodes with OSTs">
+  <style>
+    .lbl{font:12px sans-serif;fill:#e8edf4}
+    .lbl2{font:11px sans-serif;fill:#9fb0c3}
+    .box{fill:#1a2437;stroke:#25324a;stroke-width:1.5}
+    .accent{fill:#141c2b;stroke:#76b900;stroke-width:2}
+    .accent2{fill:#141c2b;stroke:#4fc3f7;stroke-width:2}
+    .line{stroke:#4fc3f7;stroke-width:1.5;fill:none}
+    .line2{stroke:#76b900;stroke-width:1.5;fill:none}
+  </style>
+  <rect x="0" y="0" width="900" height="400" fill="none"/>
+  <!-- Clients -->
+  <rect class="box" x="30" y="30" width="90" height="34" rx="6"/><text class="lbl" x="45" y="52">Client 1</text>
+  <rect class="box" x="30" y="80" width="90" height="34" rx="6"/><text class="lbl" x="45" y="102">Client 2</text>
+  <rect class="box" x="30" y="130" width="90" height="34" rx="6"/><text class="lbl" x="45" y="152">Client N</text>
+  <text class="lbl2" x="30" y="185">(one per compute node)</text>
+
+  <!-- MDS -->
+  <rect class="accent2" x="220" y="30" width="130" height="60" rx="8"/>
+  <text class="lbl" x="240" y="55">MDS</text>
+  <text class="lbl2" x="235" y="72">Metadata Server</text>
+  <rect class="box" x="235" y="100" width="100" height="28" rx="5"/><text class="lbl2" x="248" y="119">MDT (NVMe)</text>
+
+  <!-- lines client -> MDS (metadata lookup) -->
+  <path class="line" d="M120,47 L220,55"/>
+  <path class="line" d="M120,97 L220,60"/>
+  <path class="line" d="M120,147 L220,65"/>
+  <text class="lbl2" x="130" y="30">1. "where is my file?"</text>
+
+  <!-- OSS/OST cluster -->
+  <rect class="accent" x="480" y="20" width="150" height="60" rx="8"/>
+  <text class="lbl" x="500" y="45">OSS 1</text>
+  <rect class="box" x="500" y="55" width="110" height="20" rx="4"/><text class="lbl2" x="510" y="70">OST OST OST</text>
+
+  <rect class="accent" x="480" y="100" width="150" height="60" rx="8"/>
+  <text class="lbl" x="500" y="125">OSS 2</text>
+  <rect class="box" x="500" y="135" width="110" height="20" rx="4"/><text class="lbl2" x="510" y="150">OST OST OST</text>
+
+  <rect class="accent" x="480" y="180" width="150" height="60" rx="8"/>
+  <text class="lbl" x="500" y="205">OSS N</text>
+  <rect class="box" x="500" y="215" width="110" height="20" rx="4"/><text class="lbl2" x="510" y="230">OST OST OST</text>
+
+  <!-- lines clients -> OSS (parallel data path) -->
+  <path class="line2" d="M120,47 L480,50"/>
+  <path class="line2" d="M120,97 L480,130"/>
+  <path class="line2" d="M120,147 L480,210"/>
+  <path class="line2" d="M120,47 L480,130"/>
+  <path class="line2" d="M120,97 L480,210"/>
+  <text class="lbl2" x="650" y="30">2. striped, parallel data I/O</text>
+
+  <text class="lbl2" x="30" y="290">Metadata path (green→blue): who/where.</text>
+  <text class="lbl2" x="30" y="308">Data path (green): every client can read/write</text>
+  <text class="lbl2" x="30" y="324">multiple OSS nodes at once — aggregate bandwidth</text>
+  <text class="lbl2" x="30" y="340">scales with the number of OSS/OST pairs, not with</text>
+  <text class="lbl2" x="30" y="356">any single server.</text>
+</svg>
+
+<div class="callout field">
+<div class="label">Field note</div>
+Lustre performance planning is mostly about counting OSTs. Need 1 TB/s of aggregate read bandwidth? Figure out what one OSS/OST pair can sustain (often 5–20 GB/s with modern NVMe JBOFs), then divide. MDS sizing matters separately — small-file-heavy workloads (millions of tiny files) stress the MDT and often push HPC sites toward all-flash MDTs or DNE (Distributed Namespace) with multiple MDS nodes.
+</div>
+
+<h2>IBM Spectrum Scale (GPFS)</h2>
+<p>IBM Spectrum Scale — still widely known by its original name, <strong>GPFS</strong> (General Parallel File System) — takes a similar "spread the work across many servers" approach but with a different internal design philosophy. Rather than Lustre's clean split of dedicated metadata vs. object servers, GPFS uses <strong>NSD (Network Shared Disk) servers</strong> that can serve both data and metadata, and it relies heavily on distributed locking so multiple nodes can safely read and write the same files concurrently — including true POSIX semantics across the whole cluster. This makes it a strong fit for mixed HPC workloads (not just streaming large files) and for sites that want a single filesystem serving both traditional simulation codes and AI pipelines. GPFS is mature, well supported commercially, and commonly deployed on IBM Storage Scale System (ESS) appliances or on customer-built NSD servers.</p>
+
+<h2>BeeGFS: the lightweight alternative</h2>
+<p>BeeGFS was designed to be simpler to deploy and operate than Lustre or GPFS while still delivering strong parallel throughput. It splits roles similarly — a <strong>management service</strong> (registry/watchdog, not performance-critical), one or more <strong>metadata servers</strong> (directory structure and file layout, ideally on fast flash/RAID10 since metadata access latency directly affects responsiveness), and <strong>storage servers</strong> that hold striped file data — but it's known for an easier install path, good client-side tooling, and native support for striping across multiple metadata servers to reduce namespace hotspots. Many AI-focused clusters and smaller HPC shops pick BeeGFS specifically because it needs less specialized storage-admin expertise to stand up and tune than Lustre or GPFS, at the cost of a somewhat smaller enterprise support ecosystem.</p>
+
+<h2>NFS still has a job</h2>
+<div class="callout tip">
+<div class="label">Don't rip it out</div>
+Parallel filesystems are for bulk data — training sets, checkpoints, simulation output. NFS is still the right tool for home directories, small shared configuration files, environment modules, and anything low-throughput where POSIX simplicity and broad client compatibility matter more than raw bandwidth. Most production clusters run <em>both</em>: NFS for <code>/home</code> and shared tooling, a parallel filesystem for <code>/scratch</code> or <code>/data</code>.
+</div>
+
+<h2>Object storage: the AI training workhorse for datasets and checkpoints</h2>
+<p>Alongside (or sometimes instead of) a POSIX parallel filesystem, most modern AI training pipelines lean on <strong>S3-compatible object storage</strong> — whether a cloud provider's native object store or an on-prem system presenting the same S3 API. Object storage doesn't give you a POSIX filesystem tree; it gives you a flat namespace of "buckets" and "objects" accessed over HTTP, which scales extremely well horizontally and is cheap per terabyte. It has become the standard place to keep:</p>
+<ul>
+<li><strong>Training datasets</strong> — large sharded files (e.g., WebDataset tar shards, TFRecord, Parquet) that are streamed sequentially, which plays to object storage's strengths.</li>
+<li><strong>Model checkpoints</strong> — periodic full snapshots of model + optimizer state, often tens to hundreds of gigabytes per checkpoint for large models, written at intervals during training.</li>
+<li><strong>Longer-term artifact and dataset archives</strong> — durable, versioned, and far cheaper per GB than an all-flash parallel filesystem.</li>
+</ul>
+<p>The tradeoff: object storage typically has higher per-request latency and weaker consistency/locking semantics than a parallel filesystem, so it's less suited to the small random I/O and POSIX locking that some HPC simulation codes need. The common pattern in AI clusters is to <em>stage</em> data — pull datasets from object storage into local NVMe or the parallel filesystem for actual training I/O, and push checkpoints back to object storage for durability once written.</p>
+
+<h2>Storage tiers: matching cost to access pattern</h2>
+<p>No single storage tier is fast, cheap, and durable at once — every real deployment is a tiered hierarchy, hottest and most expensive data closest to the GPU:</p>
+
+<svg class="diagram" viewBox="0 0 900 400" role="img" aria-label="Storage tiering pyramid from local NVMe burst buffer at the top down to tape and cold archive at the bottom">
+  <style>
+    .tlbl{font:14px sans-serif;fill:#0b0f14;font-weight:600}
+    .tlbl2{font:11px sans-serif;fill:#9fb0c3}
+    .thead{font:13px sans-serif;fill:#e8edf4}
+  </style>
+  <rect x="0" y="0" width="900" height="400" fill="none"/>
+  <!-- Tier 1: NVMe burst buffer (narrowest, top) -->
+  <polygon points="380,20 520,20 500,70 400,70" fill="#76b900"/>
+  <text class="tlbl" x="395" y="50">Local NVMe</text>
+  <text class="thead" x="540" y="35">Tier 1 — Burst Buffer</text>
+  <text class="tlbl2" x="540" y="53">Per-node NVMe SSD. Microsecond latency, TB/s</text>
+  <text class="tlbl2" x="540" y="68">aggregate. Holds active shard / checkpoint staging.</text>
+
+  <!-- Tier 2: Parallel FS -->
+  <polygon points="340,80 560,80 530,150 370,150" fill="#4fc3f7"/>
+  <text class="tlbl" x="400" y="120">Parallel FS</text>
+  <text class="thead" x="580" y="100">Tier 2 — Lustre / GPFS / BeeGFS</text>
+  <text class="tlbl2" x="580" y="118">Shared, high-bandwidth scratch. Datasets in flight,</text>
+  <text class="tlbl2" x="580" y="133">live checkpoints, multi-node shared read.</text>
+
+  <!-- Tier 3: Object storage -->
+  <polygon points="300,160 600,160 560,250 340,250" fill="#ffb74d"/>
+  <text class="tlbl" x="410" y="210">Object / S3</text>
+  <text class="thead" x="620" y="185">Tier 3 — Object Storage</text>
+  <text class="tlbl2" x="620" y="203">Durable dataset + checkpoint repository.</text>
+  <text class="tlbl2" x="620" y="218">Cheaper per GB, higher latency, HTTP access.</text>
+
+  <!-- Tier 4: Archive/Tape -->
+  <polygon points="260,260 640,260 600,360 300,360" fill="#25324a" stroke="#9fb0c3" stroke-width="1.5"/>
+  <text class="thead" x="400" y="315">Tape / Cold Archive</text>
+  <text class="tlbl2" x="660" y="290">Tier 4 — Archive</text>
+  <text class="tlbl2" x="660" y="308">Cents-per-GB. Compliance,</text>
+  <text class="tlbl2" x="660" y="323">long-term retention, DR.</text>
+  <text class="tlbl2" x="660" y="338">Minutes-to-hours retrieval.</text>
+
+  <text class="tlbl2" x="30" y="390">Narrower tier = faster + more expensive per GB. Data moves down as it cools, up (staged) when it's needed again.</text>
+</svg>
+
+<h2>How storage connects to the fabric</h2>
+<p>None of this works without the network fabric covered in the previous section. Parallel filesystem clients and servers exchange data over the same high-speed fabric used for GPU-to-GPU traffic — usually InfiniBand or RoCE (RDMA over Converged Ethernet) — because RDMA lets storage servers place data directly into a client's memory (or, with <strong>GPUDirect Storage</strong>, directly into GPU memory) without extra copies through the CPU. This matters enormously at scale: without RDMA, every read or write burns CPU cycles copying data between kernel buffers, which caps throughput and adds latency long before the disks or network are the bottleneck.</p>
+<p>GPUDirect Storage (GDS) extends this idea one step further for AI workloads: it creates a direct DMA (direct memory access) path between storage (whether local NVMe or a supported parallel/object filesystem) and GPU memory, skipping the CPU "bounce buffer" entirely. For training jobs that are I/O-bound — loading huge datasets or writing large checkpoints — this can be the difference between GPUs sitting idle waiting on data and GPUs staying saturated.</p>
+
+<h2>Comparison at a glance</h2>
+<table>
+<thead><tr><th>System</th><th>Best for</th><th>Metadata model</th><th>Typical access</th><th>Notes</th></tr></thead>
+<tbody>
+<tr><td>Lustre</td><td>Very large-scale HPC scratch, streaming bandwidth</td><td>Dedicated MDS/MDT (can scale via DNE)</td><td>POSIX, RDMA (LNet over IB/RoCE)</td><td>Dominant in top HPC sites; strong at huge sequential I/O</td></tr>
+<tr><td>Spectrum Scale (GPFS)</td><td>Mixed HPC + enterprise workloads, strong POSIX locking</td><td>Distributed among NSD servers</td><td>POSIX, RDMA-capable</td><td>Mature, IBM-supported, good for concurrent multi-writer access</td></tr>
+<tr><td>BeeGFS</td><td>Simpler ops, small-to-mid HPC/AI clusters</td><td>Dedicated, stripeable across multiple MDS</td><td>POSIX, RDMA-capable</td><td>Easier install/tuning; smaller support ecosystem than Lustre/GPFS</td></tr>
+<tr><td>NFS</td><td>Home dirs, shared config, low-throughput shares</td><td>Single server (or HA pair)</td><td>POSIX, TCP (RDMA-over-NFS possible but less common)</td><td>Not built for aggregate parallel bandwidth</td></tr>
+<tr><td>Object storage (S3-compatible)</td><td>Datasets, checkpoints, long-term artifacts</td><td>Flat namespace, no POSIX metadata</td><td>HTTP/S3 API</td><td>Cheap, durable, horizontally scalable; higher per-op latency</td></tr>
+</tbody>
+</table>
+
+<h2>Worked example: sizing storage for a GPU training cluster</h2>
+<div class="card">
+<p><strong>Scenario:</strong> a 512-GPU training cluster (64 nodes × 8 GPUs), training a large language model, checkpointing full model + optimizer state every 30 minutes.</p>
+<p><strong>Step 1 — Checkpoint size.</strong> A large model's checkpoint typically includes model weights plus optimizer state (e.g., Adam keeps two extra tensors per parameter), which can be 3–4× the raw parameter footprint in mixed precision. For a model whose weights alone are, say, 400 GB in bf16, a full checkpoint (weights + optimizer state + misc.) might land around 1.2–1.6 TB.</p>
+<p><strong>Step 2 — Checkpoint write bandwidth needed.</strong> If the target is to write a 1.5 TB checkpoint in under 3 minutes (180 s) so training resumes quickly, that's roughly 1.5 TB / 180 s ≈ 8.5 GB/s <em>sustained aggregate write</em> from the parallel filesystem — comfortably within reach of a mid-sized Lustre or BeeGFS deployment with a handful of OSS/storage-server nodes, but well beyond what a single NFS server could sustain.</p>
+<p><strong>Step 3 — Training-data read bandwidth needed.</strong> If each GPU consumes data at roughly 1.5 GB/s (typical for image or moderate-sequence-length text pretraining once decompressed) and there are 512 GPUs, the cluster's aggregate read demand is 512 × 1.5 GB/s ≈ <strong>768 GB/s</strong> in the worst case — though in practice local NVMe caching, data sharding, and prefetching mean much of this is absorbed at the node level rather than hitting the shared filesystem directly every step.</p>
+<p><strong>Step 4 — Design the tiers.</strong> Given the above: (a) put per-node NVMe as a burst buffer to cache the active dataset shard and stage outgoing checkpoints, cutting shared-FS read pressure by an order of magnitude; (b) size the parallel filesystem (Lustre/BeeGFS/GPFS) for the ~8–10 GB/s sustained checkpoint-write burst plus whatever read traffic isn't absorbed by local caching — typically a few dozen OSTs is enough at this scale; (c) keep the dataset's durable copy and older checkpoints in S3-compatible object storage, since it's rarely read at full training speed and benefits far more from cost efficiency and durability than from ultra-low latency; (d) push checkpoints older than a retention window to tape/cold archive for compliance and disaster recovery.</p>
+</div>
+
+<div class="callout warn">
+<div class="label">Common mistake</div>
+Sizing the parallel filesystem for average throughput instead of peak. Checkpoint writes are bursty — all 64 nodes hit the filesystem at nearly the same instant every N minutes. If the filesystem is only sized for average daily throughput, every checkpoint becomes a multi-minute stall where GPUs sit idle. Size for the burst, not the average.
+</div>
+
+<h2>Further Reading</h2>
+<ul>
+<li><a href="https://wiki.lustre.org/images/6/64/LustreArchitecture-v4.pdf" target="_blank" rel="noopener">Introduction to Lustre Architecture (Lustre Wiki, PDF)</a></li>
+<li><a href="https://wiki.lustre.org/Understanding_Lustre_Internals" target="_blank" rel="noopener">Understanding Lustre Internals — Lustre Wiki</a></li>
+<li><a href="https://cvw.cac.cornell.edu/parallel-io/lustre/lustre-components" target="_blank" rel="noopener">Lustre Components — Cornell Virtual Workshop</a></li>
+<li><a href="https://www.ibm.com/docs/en/storage-scale/5.2.3?topic=overview-gpfs-architecture" target="_blank" rel="noopener">GPFS Architecture Overview — IBM Storage Scale Documentation</a></li>
+<li><a href="https://www.redbooks.ibm.com/redbooks/pdfs/sg248254.pdf" target="_blank" rel="noopener">IBM Spectrum Scale (GPFS) — IBM Redbooks</a></li>
+<li><a href="https://doc.beegfs.io/latest/architecture/overview.html" target="_blank" rel="noopener">Architecture Overview — BeeGFS Documentation</a></li>
+<li><a href="https://docs.nvidia.com/gpudirect-storage/overview-guide/index.html" target="_blank" rel="noopener">NVIDIA GPUDirect Storage — Overview Guide</a></li>
+<li><a href="https://docs.nvidia.com/gpudirect-storage/pdf/overview-guide.pdf" target="_blank" rel="noopener">NVIDIA GPUDirect Storage — Overview Guide (PDF)</a></li>
+</ul>
+
+<div class="section-nav">
+<a href="02-networking-fabric.html">← Networking &amp; Fabric</a>
+<a href="04-provisioning-bcm.html">Next: Provisioning with BCM →</a>
+</div>
+
+</main>
+</div>
+<footer><div class="wrap">Part of the HPC Cluster Build Guide.</div></footer>
+</body>
+</html>

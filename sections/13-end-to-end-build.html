@@ -1,0 +1,378 @@
+<!DOCTYPE html>
+<html data-theme="dark" lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>13 — Full End-to-End Build Walkthrough: Day 0 to Day N | HPC Cluster Build Guide</title>
+<link rel="stylesheet" href="../assets/css/style.css">
+</head>
+<body>
+<header class="top"><div class="wrap"><a href="../index.html">HPC Cluster Build Guide</a><span class="badge">Public Edition</span></div></header>
+<div class="wrap"><nav class="crumbs"><a href="12-monitoring.html">← Monitoring &amp; Observability</a></nav>
+<main>
+
+<h1>13 — Full End-to-End Build Walkthrough: Day 0 to Day N</h1>
+<p class="lede">Every section so far has looked at one layer of the stack in isolation — compute, fabric, storage, provisioning, identity, scheduling, monitoring. This capstone section puts it all back together as one continuous story: an empty rack on Day 0, a room full of idle GPUs by Day 3, and a production cluster with real researchers running real jobs by Day 12. Think of it as the "project plan" version of everything you've read — the order things happen in, why that order matters, and the checkpoints that tell you it's safe to move to the next phase.</p>
+
+<div class="callout tip">
+<div class="label">How to use this section</div>
+Each phase below links back to the deep-dive section that covers it in full technical detail. This page is deliberately the "zoomed out" view — read it first to understand the shape of a build, then dive into the linked sections for the how.
+</div>
+
+<h2>The Whole Build in One Picture</h2>
+<p>Before the phase-by-phase walkthrough, here's the timeline end to end. Real builds compress or stretch these numbers depending on cluster size (dozens of nodes vs. thousands) and how much of the hardware supply chain is already sitting in the datacenter, but the <em>order</em> of phases is remarkably constant across every HPC/AI cluster build, from a 32-GPU department cluster to a multi-thousand-GPU supercomputer.</p>
+
+<svg class="diagram" viewBox="0 0 900 500" xmlns="http://www.w3.org/2000/svg">
+  <style>
+    .lbl{font:12px var(--font,sans-serif);fill:#e8edf4}
+    .lbl-dim{font:11px var(--font,sans-serif);fill:#9fb0c3}
+    .axis{font:11px var(--font,sans-serif);fill:#9fb0c3}
+    .bar{stroke:#25324a;stroke-width:1}
+  </style>
+  <rect width="900" height="500" fill="#141c2b"/>
+  <text x="20" y="28" class="lbl" font-size="15" font-weight="700">Cluster Build Timeline — Day -30 to Day 12+</text>
+
+  <!-- axis -->
+  <line x1="170" y1="450" x2="880" y2="450" stroke="#25324a"/>
+  <text x="170" y="468" class="axis">-30</text>
+  <text x="330" y="468" class="axis">-15</text>
+  <text x="480" y="468" class="axis">0</text>
+  <text x="540" y="468" class="axis">2</text>
+  <text x="590" y="468" class="axis">4</text>
+  <text x="640" y="468" class="axis">6</text>
+  <text x="690" y="468" class="axis">8</text>
+  <text x="740" y="468" class="axis">10</text>
+  <text x="800" y="468" class="axis">12+</text>
+  <text x="480" y="486" class="axis" font-style="italic">Day →</text>
+
+  <!-- scale helper: day -30 -> x=170, day 0 -> x=480, day 12 -> x=800  (~13.4px/day pre-0, ~26.7px/day post-0) -->
+
+  <!-- Row 1: Planning -->
+  <rect x="170" y="55" width="310" height="26" rx="4" fill="#76b900" class="bar"/>
+  <text x="175" y="72" class="lbl" fill="#0b0f14" font-weight="600">Planning: sizing, topology, procurement, site readiness</text>
+  <text x="20" y="72" class="lbl-dim">Day -30→0</text>
+
+  <!-- Row 2: Physical install -->
+  <rect x="480" y="90" width="53" height="26" rx="4" fill="#4fc3f7" class="bar"/>
+  <text x="20" y="107" class="lbl-dim">Day 0-1</text>
+  <text x="540" y="107" class="lbl">Rack, cable, BMC bring-up</text>
+
+  <!-- Row 3: Head node + provisioning tool -->
+  <rect x="507" y="125" width="80" height="26" rx="4" fill="#4fc3f7" class="bar"/>
+  <text x="20" y="142" class="lbl-dim">Day 1-3</text>
+  <text x="600" y="142" class="lbl">Head node + provisioning tool</text>
+
+  <!-- Row 4: bulk provisioning + fabric -->
+  <rect x="533" y="160" width="53" height="26" rx="4" fill="#ffb74d" class="bar"/>
+  <text x="20" y="177" class="lbl-dim">Day 3-5</text>
+  <text x="600" y="177" class="lbl">PXE fleet + fabric diagnostics + NCCL</text>
+
+  <!-- Row 5: storage -->
+  <rect x="560" y="195" width="53" height="26" rx="4" fill="#ffb74d" class="bar"/>
+  <text x="20" y="212" class="lbl-dim">Day 5-7</text>
+  <text x="630" y="212" class="lbl">Parallel FS mount + throughput test</text>
+
+  <!-- Row 6: identity + scheduler -->
+  <rect x="587" y="230" width="53" height="26" rx="4" fill="#76b900" class="bar"/>
+  <text x="20" y="247" class="lbl-dim">Day 7-9</text>
+  <text x="660" y="247" class="lbl">Identity + Slurm + fleet NCCL test</text>
+
+  <!-- Row 7: monitoring -->
+  <rect x="613" y="265" width="27" height="26" rx="4" fill="#4fc3f7" class="bar"/>
+  <text x="20" y="282" class="lbl-dim">Day 9-10</text>
+  <text x="655" y="282" class="lbl">DCGM + Prometheus + Grafana live</text>
+
+  <!-- Row 8: onboarding -->
+  <rect x="640" y="300" width="53" height="26" rx="4" fill="#76b900" class="bar"/>
+  <text x="20" y="317" class="lbl-dim">Day 10-12</text>
+  <text x="710" y="317" class="lbl">DL → assoc, pilots live</text>
+
+  <!-- Row 9: steady state -->
+  <rect x="693" y="335" width="150" height="26" rx="4" fill="#9fb0c3" class="bar"/>
+  <text x="20" y="352" class="lbl-dim">Day 12+</text>
+  <text x="170" y="352" class="lbl-dim">Steady-state ops: patch, drain, capacity plan, incident response</text>
+
+  <line x1="480" y1="45" x2="480" y2="400" stroke="#ff6b6b" stroke-dasharray="3,3"/>
+  <text x="484" y="45" class="lbl-dim" fill="#ff6b6b">first rack lands</text>
+</svg>
+
+<h2>Day -30 to 0: Planning</h2>
+<div class="card">
+<p><strong>Goal:</strong> turn "we need to train/run inference on model X at scale Y" into a purchase order, a rack elevation, and a network topology diagram.</p>
+<ol>
+<li><strong>Workload requirements.</strong> What's the primary job type — dense LLM pre-training, fine-tuning, batch inference, mixed HPC simulation? This decides GPU generation, interconnect requirements, and memory footprint. See <a href="01-compute-hardware.html">01 — Compute Hardware</a>.</li>
+<li><strong>Hardware sizing.</strong> Translate workload into GPU count, node count, CPU/host memory ratio, and local NVMe scratch per node.</li>
+<li><strong>Topology design.</strong> Pick rail-optimized vs. non-blocking fat-tree, decide leaf/spine counts, and settle InfiniBand vs. RoCE for both the compute fabric and the storage/management fabric. See <a href="02-networking-fabric.html">02 — Networking &amp; Fabric</a>.</li>
+<li><strong>Storage sizing.</strong> Capacity (raw dataset + checkpoints + scratch) and required aggregate throughput, sized against the largest expected checkpoint-write burst. See <a href="03-storage.html">03 — Storage</a>.</li>
+<li><strong>Vendor procurement.</strong> Lead times for GPU nodes, switches, optics/DAC cables, and PDUs are frequently the longest pole in the schedule — order 8-16 weeks out depending on GPU generation availability.</li>
+<li><strong>Site readiness.</strong> Confirm rack space, power (kW/rack budget — modern 8-GPU nodes can pull 10-12kW each), and cooling (air vs. liquid/direct-to-chip) are provisioned <em>before</em> hardware arrives. A rack of GPU nodes sitting on a loading dock waiting for power commissioning is the single most common schedule slip in real builds.</li>
+</ol>
+</div>
+
+<h2>Day 0-1: Physical Install &amp; Cabling</h2>
+<div class="card">
+<ul>
+<li><strong>Rack the nodes.</strong> Follow the vendor rack elevation exactly — GPU trays, weight distribution, and airflow direction are not arbitrary.</li>
+<li><strong>Cable the compute fabric.</strong> Wire every GPU's NIC to its designated leaf switch port per the rail design — rail-aligned cabling (all "rail 0" NICs across every node go to the same leaf) is what makes the fat-tree non-blocking. Mistakes here are the hardest class of bug to find later, because the fabric "mostly works" but has silently degraded bisection bandwidth. See <a href="02-networking-fabric.html">02 — Networking &amp; Fabric</a>.</li>
+<li><strong>Cable the management/storage network.</strong> Separate physical (or at minimum, separate VLAN) network for provisioning, BMC, and storage traffic so a compute-fabric problem can never take down your ability to reach a node's console.</li>
+<li><strong>BMC / out-of-band setup.</strong> Assign static IPs (or DHCP reservations keyed to MAC) to every node's BMC, verify IPMI/Redfish reachability, and record serials against rack-unit position — this inventory becomes the seed data for your provisioning tool's node definitions in the very next phase.</li>
+</ul>
+<div class="callout warn"><div class="label">Field note</div>Do a full continuity/link-up sweep before powering on compute — walk the switch port list and confirm every expected link comes up at full speed <em>before</em> you start racing to install software. A single bad transceiver found on Day 5 during fabric diagnostics costs you a re-cabling detour mid-schedule; found on Day 1 it costs you five minutes.</div>
+</div>
+
+<h2>Day 1-3: Head Node + Provisioning Tool Bring-Up</h2>
+<p>This is the first real software decision of the build, and it shapes almost everything downstream — how nodes get their OS, how config drifts get corrected, how a failed node gets reimaged at 2am. Four credible paths were covered in depth earlier in this guide:</p>
+
+<div class="grid2">
+<div class="card"><h3><a href="04-provisioning-bcm.html">Base Command Manager (BCM)</a></h3>reference:<br>Commercial, NVIDIA-supported, deeply integrated with DGX/GPU stacks. Fastest path to a working cluster if budget allows.</div>
+<div class="card"><h3><a href="05-provisioning-xcat.html">xCAT</a></h3>Mature, open-source, extremely flexible, IBM/HPC lineage. Steeper learning curve, large install base in national labs.</div>
+<div class="card"><h3><a href="06-provisioning-warewulf-openhpc.html">Warewulf + OpenHPC</a></h3>Lightweight stateless-node provisioning paired with a curated open-source HPC software stack. Good middle ground for smaller teams.</div>
+<div class="card"><h3><a href="07-provisioning-baremetal-ansible.html">Bare-metal Ansible</a></h3>No dedicated provisioning daemon — PXE/kickstart plus Ansible playbooks. Maximum control and transparency, maximum DIY burden.</div>
+</div>
+
+<table>
+<caption style="caption-side:top;text-align:left;color:var(--text-dim);margin-bottom:8px">Decision matrix — which provisioning tool to choose</caption>
+<tr><th>Factor</th><th>BCM</th><th>xCAT</th><th>Warewulf + OpenHPC</th><th>Bare-metal Ansible</th></tr>
+<tr><td>Team size fit</td><td>Small-to-large ops team, limited HPC-specific expertise</td><td>Larger team with deep HPC systems experience</td><td>Small team, HPC-literate</td><td>Small team, strong general infra/DevOps skill</td></tr>
+<tr><td>Budget</td><td>$$$ (license/support cost)</td><td>Free (community); paid support optional</td><td>Free</td><td>Free (your engineering time is the cost)</td></tr>
+<tr><td>Openness / control</td><td>Lower — vendor-managed abstractions</td><td>High — fully open, very configurable</td><td>High — simple, transparent stack</td><td>Highest — you own every layer</td></tr>
+<tr><td>Time to first working cluster</td><td>Fastest</td><td>Moderate</td><td>Moderate-fast</td><td>Slowest (but most repeatable long-term)</td></tr>
+<tr><td>Best fit</td><td>Enterprise/DGX SuperPOD-style builds needing vendor support SLAs</td><td>National-lab-scale, heterogeneous hardware fleets</td><td>Academic/research clusters, OpenHPC ecosystem users</td><td>Cloud-native teams already standardized on Ansible/GitOps</td></tr>
+</table>
+
+<div class="card">
+<p>Whichever tool wins, the Day 1-3 bring-up sequence is the same shape: install the provisioning service on the head node(s), define node profiles (OS image, kernel args, disk layout, driver/CUDA version), register every node's BMC/MAC from the Day 0-1 inventory, and get the head node itself hardened, backed up, and — ideally — deployed in an HA pair before it becomes the single point of failure for the whole fleet.</p>
+</div>
+
+<h2>Day 3-5: Bulk Node Provisioning + Fabric Validation</h2>
+<div class="card">
+<ol>
+<li><strong>PXE boot the fleet.</strong> Power on all compute nodes, let them PXE into the provisioning tool, and image them in parallel (all four tools above support fleet-wide parallel imaging — this is where the tool choice starts paying off or costing you).</li>
+<li><strong>Fabric diagnostics.</strong> Run <code>ibdiagnet</code> (InfiniBand) or the RoCE-equivalent link/ECN/PFC counters sweep across every port. Confirm no unreachable nodes, no port flaps, no link running below negotiated speed, and correct subnet-manager convergence.</li>
+<li><strong>NCCL bandwidth tests.</strong> Run <code>nccl-tests</code> (<code>all_reduce_perf</code>, <code>all_gather_perf</code>) first within a node (NVLink), then across 2 nodes, then across a full rack, then full fleet. Compare measured busbw against the theoretical rail bandwidth from <a href="02-networking-fabric.html">02 — Networking &amp; Fabric</a> — a gap of more than ~10-15% at scale usually means a cabling, routing, or congestion-control misconfiguration, not a "that's just overhead" situation.</li>
+</ol>
+</div>
+
+<h2>Day 5-7: Storage Integration</h2>
+<div class="card">
+<p>Mount the parallel filesystem (Lustre, GPFS/Spectrum Scale, WEKA, VAST, etc. — see <a href="03-storage.html">03 — Storage</a>) on every compute node via the storage-side fabric, then validate before trusting it with real data:</p>
+<ul>
+<li>Single-client and aggregate multi-client throughput tests (e.g. <code>ior</code>, <code>fio</code>) against the sizing target from the planning phase.</li>
+<li>Metadata-heavy workload test (many small files) if the workload includes dataset shards or checkpoint sub-files.</li>
+<li>Checkpoint-burst simulation — write a checkpoint-sized file from every node simultaneously and confirm the filesystem sustains it without falling over; this is the single most common storage failure mode in production LLM training.</li>
+</ul>
+</div>
+
+<h2>Day 7-9: Identity Stack + Scheduler Bring-Up</h2>
+<div class="card">
+<ol>
+<li>Stand up <strong>LDAP</strong> as the directory of record (<a href="09-identity-ldap.html">09 — Identity: LDAP</a>), and <strong>SSSD</strong> on every compute node for the LDAP-to-local-account bridge, caching, and offline resilience (<a href="10-identity-sssd.html">10 — Identity: SSSD</a>).</li>
+<li>Install and configure <strong>Slurm</strong> (<a href="08-scheduling.html">08 — Scheduling</a>) — controller, database, and <code>slurmd</code> fleet-wide, with partitions matching your rack/rail topology so job placement respects fabric locality.</li>
+<li><strong>Validate with a full-fleet test job:</strong> submit an MPI/NCCL job that spans every node in the cluster. This is the true "is this cluster real" moment — it proves scheduler, fabric, storage, and identity are all working together, not just individually.</li>
+</ol>
+</div>
+
+<h2>Day 9-10: Monitoring Stack + Alerting Live</h2>
+<div class="card">
+<p>Deploy DCGM exporters on every node, Prometheus to scrape them (plus node/switch/fabric exporters), and Grafana dashboards for GPU utilization, XID errors, thermal/power, and job-level metrics (<a href="12-monitoring.html">12 — Monitoring &amp; Observability</a>). Wire alerting (Alertmanager or equivalent) for the handful of signals that actually predict trouble: ECC errors climbing, XID codes indicating Xid 79/94/etc., NVLink/fabric link flaps, and node-down. Alerting should be live <em>before</em> real users land — you want to catch a bad node from telemetry, not from a frustrated Slack message.</p>
+</div>
+
+<h2>Day 10-12: User Onboarding Pipeline Live</h2>
+<div class="card">
+<p>Wire the onboarding chain end to end (<a href="11-onboarding-dls.html">11 — Onboarding via DLs</a>): distribution-list membership change → identity account provisioned → Slurm association/QOS assigned → user notified with quick-start docs. Bring a small set of pilot users through the full pipeline first, and have them run a real (small) job before opening the gates. A day-1 checklist for each pilot user typically covers:</p>
+<table>
+<tr><th>Check</th><th>Expected result</th></tr>
+<tr><td>SSH login via LDAP/SSSD credentials</td><td>Succeeds, correct UID/GID, home directory present</td></tr>
+<tr><td>Slurm association + QOS visible</td><td><code>sacctmgr show assoc user=&lt;u&gt;</code> shows correct account/partition</td></tr>
+<tr><td>Storage access</td><td>Read/write to assigned project directory on parallel FS</td></tr>
+<tr><td>GPU visibility</td><td><code>nvidia-smi</code> inside an interactive Slurm allocation shows expected GPU count/type</td></tr>
+<tr><td>Multi-node job</td><td>Small NCCL/MPI job across 2+ allocated nodes completes and reports expected bandwidth</td></tr>
+<tr><td>Monitoring shows the job</td><td>Grafana job-level dashboard reflects the running allocation</td></tr>
+</table>
+</div>
+
+<h2>Day 12+: Steady-State Operations</h2>
+<div class="card">
+<p>The build is "done," but the cluster's life has just started. Ongoing operational cadence includes:</p>
+<ul>
+<li><strong>Patching cadence.</strong> Scheduled maintenance windows for OS/driver/firmware updates, staged through a canary partition before fleet-wide rollout.</li>
+<li><strong>Node health checks &amp; draining.</strong> Automated health checks (NHC-style) gate nodes out of the scheduler on ECC/XID/thermal anomalies before they corrupt a job; drained nodes flow into a repair queue.</li>
+<li><strong>Capacity planning.</strong> Track utilization and queue wait times against growth projections to time the next hardware order — this loops back to Day -30 planning for the <em>next</em> expansion.</li>
+<li><strong>Incident response.</strong> On-call rotation, runbooks per failure class (fabric link down, storage degraded, scheduler controller failover), and postmortems that feed back into the health-check ruleset.</li>
+</ul>
+</div>
+
+<h2>Reference Architecture — All Layers, One Diagram</h2>
+<p>Everything above stacks into a single picture: compute nodes at the bottom, fabric connecting them to each other and to storage, provisioning/identity/scheduler as the control plane, monitoring watching the whole thing.</p>
+
+<svg class="diagram" viewBox="0 0 900 500" xmlns="http://www.w3.org/2000/svg">
+  <style>
+    .t{font:12px var(--font,sans-serif);fill:#e8edf4}
+    .td{font:11px var(--font,sans-serif);fill:#9fb0c3}
+    .lay{stroke:#25324a;stroke-width:1}
+  </style>
+  <rect width="900" height="500" fill="#141c2b"/>
+  <text x="20" y="28" class="t" font-size="15" font-weight="700">Reference Architecture — Full Stack</text>
+
+  <!-- Compute layer -->
+  <rect x="40" y="380" width="820" height="70" rx="6" fill="#1a2437" class="lay"/>
+  <text x="55" y="400" class="t" font-weight="600">Compute Layer</text>
+  <rect x="60" y="410" width="90" height="30" rx="4" fill="#76b900"/><text x="72" y="429" class="t" fill="#0b0f14">GPU node</text>
+  <rect x="165" y="410" width="90" height="30" rx="4" fill="#76b900"/><text x="177" y="429" class="t" fill="#0b0f14">GPU node</text>
+  <rect x="270" y="410" width="90" height="30" rx="4" fill="#76b900"/><text x="282" y="429" class="t" fill="#0b0f14">GPU node</text>
+  <text x="380" y="429" class="td">... N nodes (rail-aligned NICs) ...</text>
+  <rect x="640" y="410" width="90" height="30" rx="4" fill="#4fc3f7"/><text x="648" y="429" class="t" fill="#0b0f14">Storage node</text>
+  <rect x="745" y="410" width="90" height="30" rx="4" fill="#4fc3f7"/><text x="753" y="429" class="t" fill="#0b0f14">Storage node</text>
+
+  <!-- Fabric layer -->
+  <rect x="40" y="300" width="820" height="60" rx="6" fill="#1a2437" class="lay"/>
+  <text x="55" y="320" class="t" font-weight="600">Fabric Layer — InfiniBand / RoCE leaf-spine (rail-optimized)</text>
+  <rect x="60" y="330" width="120" height="22" rx="4" fill="#ffb74d"/><text x="72" y="346" class="t" fill="#0b0f14">Leaf switch</text>
+  <rect x="200" y="330" width="120" height="22" rx="4" fill="#ffb74d"/><text x="212" y="346" class="t" fill="#0b0f14">Leaf switch</text>
+  <rect x="340" y="330" width="120" height="22" rx="4" fill="#ffb74d"/><text x="352" y="346" class="t" fill="#0b0f14">Leaf switch</text>
+  <rect x="560" y="330" width="140" height="22" rx="4" fill="#ff6b6b"/><text x="575" y="346" class="t" fill="#0b0f14">Spine switch(es)</text>
+  <line x1="120" y1="330" x2="620" y2="352" stroke="#25324a"/>
+
+  <!-- Control plane layer -->
+  <rect x="40" y="150" width="820" height="130" rx="6" fill="#1a2437" class="lay"/>
+  <text x="55" y="170" class="t" font-weight="600">Control Plane</text>
+  <rect x="60" y="185" width="150" height="75" rx="4" fill="#4fc3f7"/>
+  <text x="70" y="205" class="t" fill="#0b0f14" font-weight="600">Provisioning</text>
+  <text x="70" y="222" class="td" fill="#0b0f14">BCM / xCAT / Warewulf</text>
+  <text x="70" y="238" class="td" fill="#0b0f14">/ Ansible</text>
+  <rect x="230" y="185" width="150" height="75" rx="4" fill="#76b900"/>
+  <text x="240" y="205" class="t" fill="#0b0f14" font-weight="600">Identity</text>
+  <text x="240" y="222" class="td" fill="#0b0f14">LDAP directory</text>
+  <text x="240" y="238" class="td" fill="#0b0f14">+ SSSD on nodes</text>
+  <rect x="400" y="185" width="150" height="75" rx="4" fill="#ffb74d"/>
+  <text x="410" y="205" class="t" fill="#0b0f14" font-weight="600">Scheduler</text>
+  <text x="410" y="222" class="td" fill="#0b0f14">Slurm controller</text>
+  <text x="410" y="238" class="td" fill="#0b0f14">+ slurmd fleet</text>
+  <rect x="570" y="185" width="150" height="75" rx="4" fill="#ff6b6b"/>
+  <text x="580" y="205" class="t" fill="#0b0f14" font-weight="600">Onboarding</text>
+  <text x="580" y="222" class="td" fill="#0b0f14">DL → account →</text>
+  <text x="580" y="238" class="td" fill="#0b0f14">Slurm association</text>
+
+  <!-- Monitoring layer (spans top) -->
+  <rect x="40" y="60" width="820" height="70" rx="6" fill="#1a2437" class="lay"/>
+  <text x="55" y="80" class="t" font-weight="600">Monitoring &amp; Observability</text>
+  <text x="55" y="100" class="td">DCGM exporters → Prometheus → Grafana dashboards → Alertmanager</text>
+  <text x="55" y="116" class="td">(watches every layer below)</text>
+
+  <!-- connective arrows -->
+  <line x1="450" y1="130" x2="450" y2="150" stroke="#9fb0c3" marker-end="url(#arrow)"/>
+  <line x1="450" y1="280" x2="450" y2="300" stroke="#9fb0c3" marker-end="url(#arrow)"/>
+  <line x1="450" y1="360" x2="450" y2="380" stroke="#9fb0c3" marker-end="url(#arrow)"/>
+  <defs><marker id="arrow" markerWidth="8" markerHeight="8" refX="4" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#9fb0c3"/></marker></defs>
+</svg>
+
+<h2>Simulation: A Worked Capacity-Planning Example</h2>
+<div class="card">
+<p>Here's a concrete, simplified example of the kind of math that drives the "hardware sizing" step back in the Day -30 planning phase — and that gets validated for real during the Day 3-5 NCCL tests.</p>
+<p><strong>Scenario:</strong> Train a model requiring <strong>4 &times; 10<sup>21</sup> total FLOPs</strong> on a cluster of <strong>128 GPUs</strong>, each capable of <strong>~989 TFLOPS</strong> dense BF16 (H100-class peak), and assume a realistic sustained model-FLOPs-utilization (MFU) of <strong>40%</strong> once framework/communication overhead is accounted for.</p>
+<pre><code>Per-GPU sustained throughput = 989 TFLOPS × 0.40
+                              = 395.6 TFLOPS/s effective
+
+Cluster sustained throughput = 395.6 TFLOPS/s × 128 GPUs
+                              = 50,637 TFLOPS/s  (≈ 50.6 PFLOPS/s)
+
+Wall-clock time = Total FLOPs / Cluster sustained throughput
+                = 4 × 10^21 FLOPs / 5.06 × 10^16 FLOPs/s
+                = 79,051 seconds
+                ≈ 21.96 hours  (~22 hours)</code></pre>
+<p>Now the network side: assume a data-parallel + tensor-parallel job where each all-reduce step exchanges a gradient tensor of <strong>2 GB per GPU per step</strong>, and the training recipe runs one optimizer step roughly every <strong>4 seconds</strong> at this scale.</p>
+<pre><code>Required sustained per-GPU network bandwidth
+  = 2 GB / 4 s
+  = 0.5 GB/s  = 4 Gb/s  minimum, per direction, sustained
+
+Real fabrics are provisioned well above the minimum to absorb
+all-reduce ring/tree overhead and keep communication from
+becoming the bottleneck — a rail design offering 400 Gb/s per
+GPU (e.g. NDR InfiniBand or 400G RoCE) leaves ~100x headroom
+over this minimum, which is why "just barely enough" bandwidth
+sizing is a common cause of GPUs sitting idle waiting on
+all-reduce instead of computing.</code></pre>
+</div>
+
+<svg class="diagram" viewBox="0 0 900 420" xmlns="http://www.w3.org/2000/svg">
+  <style>.t{font:12px var(--font,sans-serif);fill:#e8edf4}.td{font:11px var(--font,sans-serif);fill:#9fb0c3}.n{font:22px var(--font,sans-serif);fill:#e8edf4;font-weight:700}</style>
+  <rect width="900" height="420" fill="#141c2b"/>
+  <text x="20" y="28" class="t" font-size="15" font-weight="700">Capacity Planning Example — 128 GPUs, 4×10²¹ FLOPs job</text>
+
+  <!-- three stat boxes -->
+  <rect x="40" y="60" width="240" height="140" rx="8" fill="#1a2437" stroke="#25324a"/>
+  <text x="60" y="90" class="td">GPU peak (BF16)</text>
+  <text x="60" y="130" class="n">989 TFLOPS</text>
+  <text x="60" y="155" class="td">per GPU, dense</text>
+  <text x="60" y="180" class="td">× 128 GPUs installed</text>
+
+  <rect x="330" y="60" width="240" height="140" rx="8" fill="#1a2437" stroke="#25324a"/>
+  <text x="350" y="90" class="td">Effective @ 40% MFU</text>
+  <text x="350" y="130" class="n">50.6 PFLOPS/s</text>
+  <text x="350" y="155" class="td">cluster sustained</text>
+  <text x="350" y="180" class="td">throughput</text>
+
+  <rect x="620" y="60" width="240" height="140" rx="8" fill="#1a2437" stroke="#25324a"/>
+  <text x="640" y="90" class="td">Wall-clock result</text>
+  <text x="640" y="130" class="n">≈ 22 hours</text>
+  <text x="640" y="155" class="td">to complete training run</text>
+
+  <!-- bandwidth bar comparison -->
+  <text x="40" y="245" class="t" font-weight="600">Per-GPU network bandwidth: required vs. provisioned</text>
+  <rect x="40" y="260" width="4" height="30" fill="#ff6b6b"/>
+  <text x="55" y="282" class="td">Required minimum: 4 Gb/s</text>
+
+  <rect x="40" y="310" width="800" height="30" fill="#76b900"/>
+  <text x="55" y="330" class="t" fill="#0b0f14" font-weight="600">Typical provisioned rail bandwidth: 400 Gb/s (~100x headroom)</text>
+
+  <text x="40" y="380" class="td">Headroom absorbs all-reduce ring/tree overhead, retries, and congestion — sizing "just enough" starves GPUs waiting on gradient sync.</text>
+</svg>
+
+<h2>Full Build Checklist</h2>
+<div class="card">
+<table>
+<tr><th>Phase</th><th>Checklist item</th><th>Verified by</th></tr>
+<tr><td>Planning</td><td>Workload requirements documented (job type, scale, throughput target)</td><td>Sign-off doc</td></tr>
+<tr><td>Planning</td><td>GPU/node count sized against workload FLOPs + memory needs</td><td>Capacity model (see simulation above)</td></tr>
+<tr><td>Planning</td><td>Fabric topology diagram finalized (rail design, leaf/spine counts)</td><td><a href="02-networking-fabric.html">02</a> topology review</td></tr>
+<tr><td>Planning</td><td>Storage capacity + throughput sized against checkpoint burst</td><td><a href="03-storage.html">03</a> sizing worksheet</td></tr>
+<tr><td>Planning</td><td>Hardware ordered with adequate lead time; power/cooling commissioned</td><td>PO + facilities sign-off</td></tr>
+<tr><td>Install</td><td>All nodes racked per elevation; power/airflow verified</td><td>Physical walkthrough</td></tr>
+<tr><td>Install</td><td>Fabric cabled rail-aligned; every expected link up at full speed</td><td>Switch port sweep</td></tr>
+<tr><td>Install</td><td>BMC/out-of-band reachable on every node; inventory recorded</td><td>IPMI/Redfish sweep</td></tr>
+<tr><td>Provisioning</td><td>Provisioning tool selected + installed on (HA) head node(s)</td><td>Decision matrix above</td></tr>
+<tr><td>Provisioning</td><td>Node profiles defined (OS image, driver/CUDA, disk layout)</td><td>Config review</td></tr>
+<tr><td>Provisioning</td><td>Full fleet PXE-boots and images successfully</td><td>Fleet imaging report</td></tr>
+<tr><td>Fabric validation</td><td><code>ibdiagnet</code>/RoCE counter sweep clean across fleet</td><td>Diagnostic report</td></tr>
+<tr><td>Fabric validation</td><td>NCCL bandwidth within ~10-15% of theoretical at full scale</td><td><code>nccl-tests</code> results</td></tr>
+<tr><td>Storage</td><td>Parallel FS mounted on every compute node</td><td>Mount table audit</td></tr>
+<tr><td>Storage</td><td>Aggregate throughput meets sizing target under checkpoint-burst test</td><td><code>ior</code>/<code>fio</code> results</td></tr>
+<tr><td>Identity</td><td>LDAP directory live; SSSD deployed fleet-wide</td><td><a href="09-identity-ldap.html">09</a>/<a href="10-identity-sssd.html">10</a> checklist</td></tr>
+<tr><td>Scheduler</td><td>Slurm controller + slurmd fleet configured, partitions match topology</td><td><a href="08-scheduling.html">08</a> checklist</td></tr>
+<tr><td>Scheduler</td><td>Full-fleet MPI/NCCL test job completes successfully</td><td>Job output + bandwidth check</td></tr>
+<tr><td>Monitoring</td><td>DCGM + Prometheus + Grafana live for every node</td><td>Dashboard review</td></tr>
+<tr><td>Monitoring</td><td>Alerting wired for ECC/XID/link-flap/node-down before go-live</td><td>Alert test-fire</td></tr>
+<tr><td>Onboarding</td><td>DL → account → Slurm association pipeline tested end to end</td><td><a href="11-onboarding-dls.html">11</a> checklist</td></tr>
+<tr><td>Onboarding</td><td>Pilot users pass full day-1 checklist</td><td>Table in Day 10-12 section above</td></tr>
+<tr><td>Steady state</td><td>Patch cadence + canary rollout process documented</td><td>Ops runbook</td></tr>
+<tr><td>Steady state</td><td>Automated health checks gate nodes out of scheduler on anomaly</td><td>NHC config + drain log</td></tr>
+<tr><td>Steady state</td><td>Capacity-planning review cadence scheduled (feeds next Day -30)</td><td>Recurring review calendar</td></tr>
+<tr><td>Steady state</td><td>Incident response runbooks + on-call rotation live</td><td>Runbook repo + PagerDuty/rotation schedule</td></tr>
+</table>
+</div>
+
+<h2>Further Reading</h2>
+<ul>
+<li><a href="https://www.nvidia.com/en-us/data-center/dgx-superpod/">NVIDIA DGX SuperPOD — AI Infrastructure for Enterprise Deployments</a></li>
+<li><a href="https://docs.nvidia.com/nvidia-dgx-superpod-data-center-design-dgx-h100.pdf">NVIDIA DGX SuperPOD Data Center Design Reference Guide (DGX H100)</a></li>
+<li><a href="https://docs.nvidia.com/dgx-superpod/reference-architecture-scalable-infrastructure-b200/latest/_downloads/4b3d3302fa4fc6854b595ccff50b9932/RA11334001-DSPB200-ReferenceArch.pdf">DGX SuperPOD Reference Architecture — Scalable Infrastructure (B200)</a></li>
+<li><a href="https://docs.nvidia.com/dgx-superpod/reference-architecture/scalable-infrastructure-h200/latest/_downloads/bbd08041e98eb913619944ead1f92373/RA-11336-001-DSPH200-ReferenceArch.pdf">DGX SuperPOD Reference Architecture — Scalable Infrastructure (H200)</a></li>
+<li><a href="https://docs.nvidia.com/dgx-basepod/deployment-guides/dgx-basepod-b200/latest/b200-nmc-1-1.html">DGX SuperPOD and BasePOD with DGX B200 Systems Deployment Guide (Mission Control 1.1)</a></li>
+<li><a href="https://docs.netapp.com/us-en/netapp-solutions-ai/infra/ai-eseries-superpod.html">NVIDIA DGX SuperPOD with NetApp — Design Guide</a></li>
+</ul>
+
+<div class="section-nav"><a href="12-monitoring.html">← Monitoring &amp; Observability</a><a href="14-network-fabrics-deep-dive.html">Next: Network Fabrics Deep-Dive →</a></div>
+</main></div>
+<footer><div class="wrap">Part of the HPC Cluster Build Guide.</div></footer>
+</body>
+</html>

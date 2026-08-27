@@ -1,0 +1,173 @@
+<!DOCTYPE html>
+<html data-theme="dark" lang="en">
+<head>
+<meta charset="UTF-8">
+<title>22 — Configuration Management with Puppet | HPC Cluster Build Guide</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="../assets/css/style.css">
+</head>
+<body>
+<header class="top"><div class="wrap"><a href="../index.html">HPC Cluster Build Guide</a><span class="badge">Public Edition</span></div></header>
+<div class="wrap"><nav class="crumbs"><a href="21-iac-ansible-fullstack.html">← IaC — Ansible Full-Stack</a></nav>
+<main>
+
+<h1>22 — Configuration Management with Puppet</h1>
+<p class="lede">Long before Ansible playbooks were the default answer to "how do I configure a fleet of Linux boxes," Puppet was the tool that popularized declarative, desired-state configuration management — and it's still running in production at a meaningful number of HPC centers today, particularly university and national-lab clusters with decades of institutional investment in it. Understanding Puppet's model matters even if you end up choosing Ansible, because the two tools represent genuinely different philosophies for the same problem: keeping a fleet of machines in a known-good state.</p>
+
+<h2>The core contrast: pull vs. push</h2>
+<p>Ansible, covered earlier in this guide, is <strong>agentless and push-based</strong>: a control node connects out over SSH and pushes configuration to targets on demand, when you run <code>ansible-playbook</code>. Nothing runs on the managed node between runs — there's no daemon, no periodic check-in, no local state.</p>
+<p>Puppet is the opposite model: <strong>agent-based and pull-based</strong>. Every managed node runs a persistent <code>puppet-agent</code> service. On an interval (30 minutes by default), the agent wakes up, gathers facts about itself (via Facter), sends those facts to a central Puppet server, and asks for a <strong>catalog</strong> — a compiled, node-specific description of the desired end state. The agent then applies that catalog locally, converging the node toward the declared state, and reports back what it changed. Nobody has to remember to run anything; every node in the fleet is continuously and independently correcting its own drift on its own schedule.</p>
+<p>That single architectural choice cascades into most of the practical differences between the two tools: Puppet needs a running server component and agent software installed everywhere, in exchange for continuous, unattended drift correction. Ansible needs nothing installed on targets, in exchange for configuration only happening exactly when you trigger it.</p>
+
+<svg class="diagram" viewBox="0 0 900 380" xmlns="http://www.w3.org/2000/svg">
+  <text x="450" y="28" text-anchor="middle" fill="#e8edf4" font-size="16" font-weight="700">Puppet Agent/Master Pull Architecture</text>
+
+  <rect x="330" y="55" width="240" height="130" rx="8" fill="#1a2437" stroke="#25324a"/>
+  <text x="450" y="78" text-anchor="middle" fill="#76b900" font-size="13" font-weight="700">Puppet Server</text>
+  <text x="450" y="99" text-anchor="middle" fill="#9fb0c3" font-size="11">manifests (.pp) + modules</text>
+  <text x="450" y="117" text-anchor="middle" fill="#9fb0c3" font-size="11">Hiera data (hierarchy)</text>
+  <text x="450" y="135" text-anchor="middle" fill="#9fb0c3" font-size="11">compiles per-node catalog</text>
+  <text x="450" y="153" text-anchor="middle" fill="#4fc3f7" font-size="11">stores reports → PuppetDB</text>
+  <text x="450" y="171" text-anchor="middle" fill="#9fb0c3" font-size="10">code deployed via r10k</text>
+
+  <rect x="60" y="230" width="200" height="110" rx="8" fill="#141c2b" stroke="#25324a"/>
+  <text x="160" y="253" text-anchor="middle" fill="#e8edf4" font-size="12" font-weight="700">Compute Node A</text>
+  <text x="160" y="273" text-anchor="middle" fill="#9fb0c3" font-size="10">puppet-agent (daemon)</text>
+  <text x="160" y="291" text-anchor="middle" fill="#9fb0c3" font-size="10">runs every 30 min</text>
+  <text x="160" y="309" text-anchor="middle" fill="#9fb0c3" font-size="10">Facter facts → catalog → apply</text>
+
+  <rect x="350" y="230" width="200" height="110" rx="8" fill="#141c2b" stroke="#25324a"/>
+  <text x="450" y="253" text-anchor="middle" fill="#e8edf4" font-size="12" font-weight="700">Login Node</text>
+  <text x="450" y="273" text-anchor="middle" fill="#9fb0c3" font-size="10">puppet-agent (daemon)</text>
+  <text x="450" y="291" text-anchor="middle" fill="#9fb0c3" font-size="10">runs every 30 min</text>
+  <text x="450" y="309" text-anchor="middle" fill="#9fb0c3" font-size="10">Facter facts → catalog → apply</text>
+
+  <rect x="640" y="230" width="200" height="110" rx="8" fill="#141c2b" stroke="#25324a"/>
+  <text x="740" y="253" text-anchor="middle" fill="#e8edf4" font-size="12" font-weight="700">Compute Node N</text>
+  <text x="740" y="273" text-anchor="middle" fill="#9fb0c3" font-size="10">puppet-agent (daemon)</text>
+  <text x="740" y="291" text-anchor="middle" fill="#9fb0c3" font-size="10">runs every 30 min</text>
+  <text x="740" y="309" text-anchor="middle" fill="#9fb0c3" font-size="10">Facter facts → catalog → apply</text>
+
+  <path d="M180 230 L400 185" stroke="#4fc3f7" stroke-width="2" fill="none" marker-end="url(#arrowp)"/>
+  <path d="M450 230 L450 185" stroke="#4fc3f7" stroke-width="2" fill="none" marker-end="url(#arrowp)"/>
+  <path d="M720 230 L500 185" stroke="#4fc3f7" stroke-width="2" fill="none" marker-end="url(#arrowp)"/>
+  <text x="450" y="205" text-anchor="middle" fill="#9fb0c3" font-size="10">agents PULL: send facts, request catalog</text>
+
+  <defs>
+    <marker id="arrowp" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto">
+      <path d="M0,0 L8,4 L0,8 Z" fill="#4fc3f7"/>
+    </marker>
+  </defs>
+</svg>
+
+<h2>Core Puppet concepts</h2>
+<h3>Manifests, modules, classes</h3>
+<p>Puppet configuration is written in its own declarative DSL, in <code>.pp</code> files called <strong>manifests</strong>. A manifest declares <strong>resources</strong> — packages, files, services, users — and their desired state ("this package should be installed," "this service should be running and enabled"), not the imperative steps to get there. Manifests are organized into <strong>modules</strong>, a standard directory layout (<code>manifests/</code>, <code>files/</code>, <code>templates/</code>, <code>data/</code>) that bundles related configuration into a reusable, shareable unit. Within a module, a <strong>class</strong> is a named, reusable block of Puppet code — the equivalent of an Ansible role — that gets declared by name wherever it's needed.</p>
+<h3>The catalog and compile process</h3>
+<p>When an agent checks in, the Puppet server doesn't just hand back raw manifest text — it <strong>compiles</strong> all the classes assigned to that specific node, resolves Hiera data lookups, evaluates any conditional logic, and produces a <strong>catalog</strong>: a static, fully-resolved, node-specific document listing every resource and its dependency order. The agent applies only that catalog. This compile step is where Puppet does the heavy lifting of turning generic, parameterized code into "what exactly should node X look like right now."</p>
+<h3>Hiera — separating data from code</h3>
+<p><strong>Hiera</strong> is Puppet's built-in hierarchical key-value data lookup system. Instead of hardcoding values (package versions, NTP servers, Slurm cluster names) inside manifests, you look them up from external YAML files organized into a <strong>hierarchy</strong> — typically something like "per-node overrides → per-role → per-datacenter → global defaults" — configured in a <code>hiera.yaml</code> file. Puppet facts (hostname, OS, custom facts like a node's cluster role) drive which hierarchy level a given lookup checks first, following a "first match wins, with fallthrough to defaults" pattern. This is the same underlying idea as Ansible's group_vars/host_vars, just built into the language itself.</p>
+<h3>PuppetDB</h3>
+<p><strong>PuppetDB</strong> is Puppet's storage and query layer: every agent run's facts, catalog, and report get stored there, queryable via its API or the <code>puppet query</code> command. It's what lets you answer fleet-wide questions like "which nodes are running an out-of-date kernel package" or "which nodes failed their last run" without SSHing anywhere.</p>
+<h3>r10k / Code Manager — deploying modules</h3>
+<p><strong>r10k</strong> (and Puppet Enterprise's managed equivalent, Code Manager) is the tool that gets your Puppet code from a Git "control repository" onto the Puppet server. A control repo's branches map directly to Puppet <strong>environments</strong> (e.g. a <code>production</code> branch becomes the <code>production</code> environment), and a <code>Puppetfile</code> at its root pins exactly which module versions get pulled in from the Forge or other Git repos. Running <code>r10k deploy environment</code> syncs the server's on-disk environments to match what's declared in Git — the Puppet-world equivalent of a CI/CD deploy step.</p>
+
+<h2>Why HPC sites historically chose Puppet</h2>
+<p>Puppet predates Ansible by several years and had a multi-year head start building a mature module ecosystem (the Puppet Forge) and strong desired-state enforcement guarantees. Several traits made it attractive specifically for research-computing and university HPC centers: continuous drift correction meant a manually-patched node would self-heal back to policy within 30 minutes without anyone noticing the drift happened; the agent/master model scales well to large, heterogeneous fleets with long-lived infrastructure teams who could invest in learning the DSL; and because many national labs and universities adopted it early, there's a real body of public, reusable HPC-specific Puppet code — for example EDF's <a href="https://github.com/edf-hpc/puppet-hpc">puppet-hpc</a> generic HPC cluster stack, and the University of Luxembourg's <a href="https://github.com/ULHPC/puppet-slurm">puppet-slurm</a> module for managing Slurm.</p>
+
+<h2>A realistic HPC module structure: roles and profiles</h2>
+<p>Almost every mature Puppet codebase — HPC or otherwise — converges on the same pattern, known as <strong>roles and profiles</strong>. A <strong>profile</strong> is technology-specific glue (how to configure Slurm, how to configure Munge, how to configure GPU drivers), while a <strong>role</strong> is business-specific: it composes one or more profiles into "what this class of machine actually is." Nodes are only ever assigned a role, never individual profiles directly, which keeps the node classification layer thin and stable while the implementation detail lives in profiles.</p>
+<pre><code>site/
+├── roles/
+│   └── manifests/
+│       ├── compute_node.pp    # class roles::compute_node
+│       └── login_node.pp      # class roles::login_node
+└── profiles/
+    └── manifests/
+        ├── slurm.pp           # class profiles::slurm
+        ├── munge.pp           # class profiles::munge
+        └── gpu_drivers.pp     # class profiles::gpu_drivers
+</code></pre>
+
+<h2>Example manifest + Hiera data</h2>
+<p>A role simply composes profiles; the profiles reference Hiera-supplied data rather than hardcoding it:</p>
+<pre><code># site/roles/manifests/compute_node.pp
+class roles::compute_node {
+  include profiles::munge
+  include profiles::slurm
+  include profiles::gpu_drivers
+}
+
+# site/profiles/manifests/slurm.pp
+class profiles::slurm (
+  String $cluster_name    = lookup('profiles::slurm::cluster_name'),
+  String $controller_host = lookup('profiles::slurm::controller_host'),
+  Integer $slurmd_port     = lookup('profiles::slurm::slurmd_port', Integer, 'first', 6818),
+) {
+  package { 'slurm-slurmd': ensure => installed }
+
+  file { '/etc/slurm/slurm.conf':
+    ensure  => file,
+    content => template('profiles/slurm.conf.epp'),
+    require => Package['slurm-slurmd'],
+  }
+
+  service { 'slurmd':
+    ensure  => running,
+    enable  => true,
+    require => File['/etc/slurm/slurm.conf'],
+  }
+}
+</code></pre>
+<pre><code># hiera.yaml
+version: 5
+hierarchy:
+  - name: "Per-node overrides"
+    path: "nodes/%{trusted.certname}.yaml"
+  - name: "Per-role data"
+    path: "roles/%{facts.role}.yaml"
+  - name: "Common defaults"
+    path: "common.yaml"
+
+# data/roles/compute_node.yaml
+profiles::slurm::cluster_name: "research-cluster-01"
+profiles::slurm::controller_host: "slurm-ctrl-01.cluster.local"
+profiles::slurm::slurmd_port: 6818
+profiles::gpu_drivers::driver_version: "550.90.07"
+</code></pre>
+
+<h2>Puppet vs. Ansible for HPC — tradeoffs</h2>
+<table>
+<tr><th>Dimension</th><th>Puppet</th><th>Ansible</th></tr>
+<tr><td>Execution model</td><td>Pull — agents check in on an interval and request a catalog</td><td>Push — control node connects out and runs on demand</td></tr>
+<tr><td>Node footprint</td><td>Persistent <code>puppet-agent</code> daemon on every node</td><td>None — only SSH + Python required on targets</td></tr>
+<tr><td>Drift handling</td><td>Continuous, automatic — drift self-corrects within one agent interval</td><td>Only when you explicitly re-run a playbook</td></tr>
+<tr><td>Data separation</td><td>Hiera, built into the language</td><td>group_vars/host_vars, inventory variables</td></tr>
+<tr><td>Learning curve</td><td>Custom declarative DSL, catalog/compile model to internalize</td><td>YAML + Jinja2 — generally faster to onboard new admins</td></tr>
+<tr><td>Infrastructure needed</td><td>Puppet server (or PE), PuppetDB, r10k/Code Manager pipeline</td><td>None beyond the control node itself</td></tr>
+<tr><td>Best fit</td><td>Long-lived fleets that benefit from unattended, continuous enforcement</td><td>Environments that want zero agent footprint and full control over exactly when changes land</td></tr>
+</table>
+<div class="callout tip">
+<div class="label">Why this matters</div>
+Neither model is strictly "better" — they optimize for different failure modes. Puppet trades agent overhead for hands-off drift correction; Ansible trades continuous enforcement for zero footprint and precise control over when changes are applied. Many sites that started on Puppet in the 2010s still run it today simply because the switching cost of re-platforming a mature, working control repo rarely clears the bar — while newer HPC builds increasingly default to Ansible for its lower operational surface area.
+</div>
+
+<h2>Further Reading</h2>
+<ul>
+<li><a href="https://www.puppet.com/docs/puppet/7/lang_classes.html">Puppet docs — Classes</a></li>
+<li><a href="https://www.puppet.com/docs/puppet/7/subsystem_catalog_compilation.html">Puppet docs — Catalog compilation</a></li>
+<li><a href="https://www.puppet.com/docs/puppet/7/modules_fundamentals.html">Puppet docs — Modules overview</a></li>
+<li><a href="https://www.puppet.com/docs/puppet/7/hiera_intro.html">Puppet docs — About Hiera</a></li>
+<li><a href="https://www.puppet.com/docs/puppet/7/hiera_config_yaml_5.html">Puppet docs — hiera.yaml configuration</a></li>
+<li><a href="https://www.puppet.com/docs/pe/2023.8/set-up-r10k">Puppet docs — Set up r10k</a></li>
+<li><a href="https://github.com/puppetlabs/r10k">puppetlabs/r10k on GitHub</a></li>
+<li><a href="https://github.com/edf-hpc/puppet-hpc">EDF — puppet-hpc: generic Puppet configuration for HPC clusters</a></li>
+<li><a href="https://github.com/ULHPC/puppet-slurm">University of Luxembourg — puppet-slurm module</a></li>
+<li><a href="https://www.puppet.com/blog/hpc-configuration">Puppet — HPC Configuration: How Configuration Management Can Enhance AI Workload Efficiency</a></li>
+</ul>
+
+<div class="section-nav"><a href="21-iac-ansible-fullstack.html">← IaC — Ansible Full-Stack</a><a href="23-observability-deep-dive.html">Next: Observability Deep-Dive →</a></div>
+</main></div>
+<footer><div class="wrap">Part of the HPC Cluster Build Guide.</div></footer>
+</body>
+</html>

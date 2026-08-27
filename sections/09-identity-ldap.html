@@ -1,0 +1,306 @@
+<!DOCTYPE html>
+<html data-theme="dark" lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Identity &amp; Access: Integrating LDAP with Your Cluster | HPC Cluster Build Guide</title>
+<link rel="stylesheet" href="../assets/css/style.css">
+</head>
+<body>
+<header class="top"><div class="wrap"><a href="../index.html">HPC Cluster Build Guide</a><span class="badge">Public Edition</span></div></header>
+<div class="wrap"><nav class="crumbs"><a href="08-scheduling.html">← Job Schedulers</a></nav>
+<main>
+
+<h1>09 — Identity &amp; Access: Integrating LDAP with Your Cluster</h1>
+<p class="lede">Every job on your cluster runs as somebody. Before a scheduler can enforce fair-share policy, before a filesystem can enforce ownership, and before an auditor can answer "who ran what, when" — the cluster needs one consistent, cluster-wide answer to the question "who is this user, and what are they allowed to touch?" That answer comes from a directory service, and in HPC the directory protocol of choice is LDAP.</p>
+
+<div class="card">
+<p>This section explains LDAP itself — what it is, why clusters depend on it, where it physically sits in your architecture, when to stand it up in your build sequence, and how to actually deploy and wire it in. Section 10 picks up where this one ends: caching LDAP identity at scale with SSSD on every compute node.</p>
+</div>
+
+<h2>WHAT — What LDAP Actually Is</h2>
+<p><strong>LDAP</strong> (Lightweight Directory Access Protocol) is not a piece of software — it is a <em>protocol</em>, standardized in <a href="https://www.rfc-editor.org/rfc/rfc4511">RFC 4511</a>, for reading and writing entries in a hierarchical directory. Think of it as the read-heavy, hierarchical cousin of a relational database: instead of tables and rows optimized for transactional writes, you get a tree of named entries optimized for fast, structured lookups — "give me the UID and shell for user jsmith" thousands of times a second, from thousands of nodes.</p>
+
+<h3>The Directory Information Tree (DIT)</h3>
+<p>Every LDAP directory is organized as a tree, called the <strong>DIT</strong>. Each node in the tree is an <strong>entry</strong>, uniquely identified by a <strong>Distinguished Name (DN)</strong> — the LDAP equivalent of a full file path. A typical HPC DIT looks like this:</p>
+
+<pre><code>dc=cluster,dc=example,dc=org
+├── ou=People
+│   ├── uid=jsmith,ou=People,dc=cluster,dc=example,dc=org
+│   └── uid=agupta,ou=People,dc=cluster,dc=example,dc=org
+└── ou=Groups
+    ├── cn=researchers,ou=Groups,dc=cluster,dc=example,dc=org
+    └── cn=admins,ou=Groups,dc=cluster,dc=example,dc=org
+</code></pre>
+
+<p>Each entry is built from one or more <strong>objectClasses</strong>, which define which attributes it must and may carry. For POSIX-style Linux accounts (the kind your cluster needs), the two workhorse objectClasses are:</p>
+
+<table>
+<thead><tr><th>objectClass</th><th>Purpose</th><th>Key attributes</th></tr></thead>
+<tbody>
+<tr><td><code>posixAccount</code></td><td>Represents a Unix user account</td><td><code>uid</code>, <code>uidNumber</code>, <code>gidNumber</code>, <code>homeDirectory</code>, <code>loginShell</code></td></tr>
+<tr><td><code>posixGroup</code></td><td>Represents a Unix group</td><td><code>cn</code>, <code>gidNumber</code>, <code>memberUid</code></td></tr>
+<tr><td><code>inetOrgPerson</code></td><td>Human-readable identity attributes layered on top of an account</td><td><code>cn</code>, <code>sn</code>, <code>mail</code></td></tr>
+</tbody>
+</table>
+
+<p>An example entry, in LDIF (LDAP Data Interchange Format) — the plain-text format used to define and import directory entries:</p>
+
+<pre><code>dn: uid=jsmith,ou=People,dc=cluster,dc=example,dc=org
+objectClass: inetOrgPerson
+objectClass: posixAccount
+objectClass: top
+uid: jsmith
+cn: Jane Smith
+sn: Smith
+mail: jsmith@example.org
+uidNumber: 100234
+gidNumber: 50000
+homeDirectory: /home/jsmith
+loginShell: /bin/bash</code></pre>
+
+<div class="callout">
+<p><strong>LDAP the protocol vs. the directory that speaks it.</strong> "LDAP" itself does not store anything — it's the wire protocol. The actual server holding the data is a specific directory implementation. In HPC you'll most often meet:</p>
+<ul>
+<li><strong>OpenLDAP</strong> — the lightweight, open-source <code>slapd</code> daemon; the traditional choice for a standalone Linux-only cluster identity store.</li>
+<li><strong>389 Directory Server</strong> — Red Hat's enterprise-grade LDAP server, the engine underneath FreeIPA.</li>
+<li><strong>FreeIPA</strong> — a full identity management suite (389-DS + MIT Kerberos + a CA + DNS + a web UI) that speaks LDAP but gives you Kerberos SSO and centralized policy for free.</li>
+<li><strong>Active Directory</strong> — Microsoft's directory; also speaks LDAP (plus Kerberos), common when a cluster has to share identity with a Windows-heavy corporate environment.</li>
+</ul>
+</div>
+
+<h2>WHY — Why Clusters Cannot Run on Local <code>/etc/passwd</code></h2>
+<p>A single workstation happily keeps its user list in <code>/etc/passwd</code> and <code>/etc/group</code>. An HPC cluster with hundreds or thousands of compute nodes cannot, for reasons that compound quickly at scale:</p>
+
+<div class="card">
+<ul>
+<li><strong>UID/GID consistency.</strong> If <code>jsmith</code> is UID 100234 on the login node but UID 100987 on compute node <code>c0421</code> (because the accounts were created locally, in a different order, on each node), then file ownership becomes meaningless the moment a job writes to a shared parallel filesystem. Job A's output looks like it's owned by a completely different person on a different node.</li>
+<li><strong>Onboarding/offboarding at scale.</strong> Editing <code>/etc/passwd</code> by hand — or even via a config-management push — on 2,000 nodes every time a researcher joins or leaves is slow and error-prone. A directory update is a single write, propagated everywhere in seconds.</li>
+<li><strong>Single source of truth.</strong> The scheduler (Slurm), the filesystem (Lustre/GPFS/NFS), the login nodes, and any web portals all need to agree on who a user is and which groups grant them budget/allocation access. One directory, one truth, no drift.</li>
+<li><strong>Auditability and offboarding compliance.</strong> Security reviews routinely need to answer "list every account with access to this cluster" and "prove this ex-employee's access was revoked on day X." A central directory with logging gives you that in one query; grepping 2,000 <code>/etc/passwd</code> files does not.</li>
+<li><strong>Group-based authorization.</strong> Slurm QOS/partition access, filesystem ACLs, and sudo policy are almost always expressed as "members of group X" — which only works if group membership is centrally and consistently defined.</li>
+</ul>
+</div>
+
+<h2>WHERE — LDAP's Place in the Cluster Architecture</h2>
+<p>Identity flows outward from one authoritative source to every node that needs to authenticate a user or resolve a UID:</p>
+
+<svg class="diagram" viewBox="0 0 900 400" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Diagram of the LDAP directory tree structure">
+  <rect x="0" y="0" width="900" height="400" fill="none"/>
+  <rect x="370" y="20" width="160" height="46" rx="6" fill="#1e293b" stroke="#38bdf8" stroke-width="2"/>
+  <text x="450" y="48" text-anchor="middle" fill="#e2e8f0" font-size="15" font-family="monospace">dc=cluster,dc=org</text>
+
+  <line x1="450" y1="66" x2="250" y2="120" stroke="#64748b" stroke-width="2"/>
+  <line x1="450" y1="66" x2="650" y2="120" stroke="#64748b" stroke-width="2"/>
+
+  <rect x="170" y="120" width="160" height="44" rx="6" fill="#1e293b" stroke="#22c55e" stroke-width="2"/>
+  <text x="250" y="147" text-anchor="middle" fill="#e2e8f0" font-size="14" font-family="monospace">ou=People</text>
+
+  <rect x="570" y="120" width="160" height="44" rx="6" fill="#1e293b" stroke="#f59e0b" stroke-width="2"/>
+  <text x="650" y="147" text-anchor="middle" fill="#e2e8f0" font-size="14" font-family="monospace">ou=Groups</text>
+
+  <line x1="250" y1="164" x2="130" y2="220" stroke="#64748b" stroke-width="1.5"/>
+  <line x1="250" y1="164" x2="250" y2="220" stroke="#64748b" stroke-width="1.5"/>
+  <line x1="250" y1="164" x2="370" y2="220" stroke="#64748b" stroke-width="1.5"/>
+
+  <rect x="50" y="220" width="160" height="52" rx="6" fill="#0f172a" stroke="#22c55e" stroke-width="1.5"/>
+  <text x="130" y="242" text-anchor="middle" fill="#cbd5e1" font-size="11" font-family="monospace">uid=jsmith</text>
+  <text x="130" y="258" text-anchor="middle" fill="#94a3b8" font-size="10" font-family="monospace">uidNumber:100234</text>
+
+  <rect x="170" y="220" width="160" height="52" rx="6" fill="#0f172a" stroke="#22c55e" stroke-width="1.5"/>
+  <text x="250" y="242" text-anchor="middle" fill="#cbd5e1" font-size="11" font-family="monospace">uid=agupta</text>
+  <text x="250" y="258" text-anchor="middle" fill="#94a3b8" font-size="10" font-family="monospace">uidNumber:100235</text>
+
+  <rect x="290" y="220" width="160" height="52" rx="6" fill="#0f172a" stroke="#22c55e" stroke-width="1.5"/>
+  <text x="370" y="242" text-anchor="middle" fill="#cbd5e1" font-size="11" font-family="monospace">uid=svc-slurm</text>
+  <text x="370" y="258" text-anchor="middle" fill="#94a3b8" font-size="10" font-family="monospace">uidNumber:499</text>
+
+  <line x1="650" y1="164" x2="570" y2="220" stroke="#64748b" stroke-width="1.5"/>
+  <line x1="650" y1="164" x2="730" y2="220" stroke="#64748b" stroke-width="1.5"/>
+
+  <rect x="490" y="220" width="160" height="52" rx="6" fill="#0f172a" stroke="#f59e0b" stroke-width="1.5"/>
+  <text x="570" y="242" text-anchor="middle" fill="#cbd5e1" font-size="11" font-family="monospace">cn=researchers</text>
+  <text x="570" y="258" text-anchor="middle" fill="#94a3b8" font-size="10" font-family="monospace">gidNumber:50000</text>
+
+  <rect x="650" y="220" width="160" height="52" rx="6" fill="#0f172a" stroke="#f59e0b" stroke-width="1.5"/>
+  <text x="730" y="242" text-anchor="middle" fill="#cbd5e1" font-size="11" font-family="monospace">cn=admins</text>
+  <text x="730" y="258" text-anchor="middle" fill="#94a3b8" font-size="10" font-family="monospace">gidNumber:50001</text>
+
+  <text x="450" y="330" text-anchor="middle" fill="#64748b" font-size="12" font-family="sans-serif">dc=cluster,dc=org → ou=People / ou=Groups → posixAccount / posixGroup entries</text>
+  <text x="450" y="352" text-anchor="middle" fill="#64748b" font-size="12" font-family="sans-serif">Each entry's DN is its full path down the tree, e.g. uid=jsmith,ou=People,dc=cluster,dc=org</text>
+</svg>
+
+<div class="card">
+<ul>
+<li><strong>Login/head nodes</strong> authenticate interactive SSH sessions against the directory — this is where users actually type a password or present a key that needs a UID/GID lookup behind it.</li>
+<li><strong>Compute nodes</strong> almost never talk to LDAP directly for every lookup. Instead they run <strong>SSSD</strong> (System Security Services Daemon), which caches identity and authentication results locally so that a flaky network blip or an LDAP server restart doesn't stall ten thousand simultaneous job-launch UID lookups. Full setup is in <a href="10-identity-sssd.html">Section 10 — SSSD Integration</a>.</li>
+<li><strong>The LDAP server itself</strong> should not live on a head node in any production cluster. Put it on dedicated, replicated servers (at minimum a primary + one syncrepl consumer) outside the failure domain of your login/scheduler nodes — if LDAP goes down, nobody can log in or launch jobs anywhere, so it needs its own uptime story, backups, and monitoring independent of the rest of the stack. Many sites run it as a small VM pair or a pair of dedicated identity nodes.</li>
+</ul>
+</div>
+
+<svg class="diagram" viewBox="0 0 900 400" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Diagram of the authentication flow from login node through SSSD to the LDAP server over LDAPS">
+  <rect x="30" y="150" width="150" height="70" rx="8" fill="#1e293b" stroke="#38bdf8" stroke-width="2"/>
+  <text x="105" y="180" text-anchor="middle" fill="#e2e8f0" font-size="13" font-family="sans-serif">User SSH</text>
+  <text x="105" y="198" text-anchor="middle" fill="#94a3b8" font-size="11" font-family="sans-serif">login node</text>
+
+  <line x1="180" y1="185" x2="290" y2="185" stroke="#38bdf8" stroke-width="2" marker-end="url(#arrow)"/>
+  <text x="235" y="175" text-anchor="middle" fill="#64748b" font-size="10" font-family="sans-serif">PAM/NSS</text>
+
+  <rect x="290" y="150" width="150" height="70" rx="8" fill="#1e293b" stroke="#22c55e" stroke-width="2"/>
+  <text x="365" y="180" text-anchor="middle" fill="#e2e8f0" font-size="13" font-family="sans-serif">SSSD</text>
+  <text x="365" y="198" text-anchor="middle" fill="#94a3b8" font-size="11" font-family="sans-serif">local cache</text>
+
+  <line x1="440" y1="170" x2="550" y2="120" stroke="#f59e0b" stroke-width="2" marker-end="url(#arrow)"/>
+  <text x="500" y="105" text-anchor="middle" fill="#64748b" font-size="10" font-family="sans-serif">LDAPS :636 (TLS)</text>
+
+  <rect x="550" y="60" width="170" height="70" rx="8" fill="#1e293b" stroke="#f59e0b" stroke-width="2"/>
+  <text x="635" y="90" text-anchor="middle" fill="#e2e8f0" font-size="13" font-family="sans-serif">LDAP Server</text>
+  <text x="635" y="108" text-anchor="middle" fill="#94a3b8" font-size="11" font-family="sans-serif">dedicated / replicated</text>
+
+  <line x1="440" y1="200" x2="550" y2="280" stroke="#a855f7" stroke-width="2" marker-end="url(#arrow)" stroke-dasharray="5,4"/>
+  <text x="500" y="255" text-anchor="middle" fill="#64748b" font-size="10" font-family="sans-serif">cache miss only</text>
+
+  <rect x="550" y="280" width="170" height="70" rx="8" fill="#0f172a" stroke="#a855f7" stroke-width="1.5" stroke-dasharray="4,3"/>
+  <text x="635" y="310" text-anchor="middle" fill="#cbd5e1" font-size="12" font-family="sans-serif">Compute Nodes</text>
+  <text x="635" y="328" text-anchor="middle" fill="#94a3b8" font-size="10" font-family="sans-serif">each runs its own SSSD</text>
+
+  <line x1="720" y1="95" x2="820" y2="95" stroke="#22c55e" stroke-width="2" stroke-dasharray="4,3"/>
+  <text x="825" y="99" fill="#64748b" font-size="10" font-family="sans-serif">→ replica</text>
+
+  <defs>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#64748b"/>
+    </marker>
+  </defs>
+
+  <text x="450" y="375" text-anchor="middle" fill="#64748b" font-size="12" font-family="sans-serif">Login node PAM/NSS asks SSSD first; SSSD serves from cache or queries LDAP over TLS (LDAPS) and caches the result</text>
+</svg>
+
+<h2>WHEN — Where This Fits in the Build Sequence</h2>
+<p>Identity is a foundation layer, not an afterthought bolted on after users start complaining. Sequence it like this:</p>
+
+<ol>
+<li><strong>After</strong> base OS provisioning and networking are stable (nodes can resolve DNS and reach each other) — LDAP needs working name resolution and, ideally, NTP-synced clocks (critical if you layer Kerberos on top later).</li>
+<li><strong>Before</strong> you open the cluster to any real users. Local accounts created "just to get started" become technical debt the moment a second person needs an account, and reconciling ad-hoc local UIDs against a newly-introduced directory is a painful, error-prone migration.</li>
+<li><strong>Before or alongside</strong> scheduler (Slurm) setup — not after. Slurm accounting, fair-share, and job ownership all key off UID/GID. If Slurm is configured and jobs have already run under locally-assigned UIDs, backfilling consistent UID/GIDs later means re-chowning accounting records and, in the worst case, files already written to the shared filesystem under the "wrong" (soon to be reassigned) UID.</li>
+<li><strong>Before</strong> the parallel filesystem is populated with real user data, for the same UID-consistency reason.</li>
+</ol>
+
+<h2>HOW — Deploying and Wiring In LDAP</h2>
+
+<h3>Step 1 — Choose and deploy a directory</h3>
+<p>For a Linux-only HPC cluster with modest identity needs, <strong>OpenLDAP</strong> is lightweight and well understood. If you also want Kerberos SSO, a certificate authority, and a web UI out of the box, <strong>FreeIPA</strong> bundles all of that around 389-DS and is often the better long-term choice for a cluster that will grow.</p>
+
+<p><strong>OpenLDAP (Debian/Ubuntu):</strong></p>
+<pre><code>sudo apt-get install slapd ldap-utils
+sudo dpkg-reconfigure slapd
+# Prompts you for: base DN (e.g. dc=cluster,dc=example,dc=org),
+# admin password, database backend (mdb is the current default)</code></pre>
+
+<p><strong>OpenLDAP (RHEL/Rocky):</strong></p>
+<pre><code>sudo dnf install openldap-servers openldap-clients
+sudo systemctl enable --now slapd
+# RHEL ships slapd already using cn=config (OLC); seed it via
+# /etc/openldap/slapd.d or the provided .ldif bootstrap files</code></pre>
+
+<p><strong>FreeIPA server:</strong></p>
+<pre><code>sudo dnf install freeipa-server
+sudo ipa-server-install \
+  --realm=CLUSTER.EXAMPLE.ORG \
+  --domain=cluster.example.org \
+  --ds-password=<directory manager password> \
+  --admin-password=<IPA admin password> \
+  --setup-dns --no-forwarders</code></pre>
+<p><code>ipa-server-install</code> stands up 389 Directory Server, an MIT Kerberos KDC, a Dogtag CA, and (optionally) DNS in one guided run — see the official <a href="https://www.freeipa.org/page/Quick_Start_Guide">FreeIPA Quick Start Guide</a>.</p>
+
+<h3>Step 2 — Design the DIT/OU structure</h3>
+<p>Keep it flat and predictable. For most HPC sites, two top-level organizational units cover everything:</p>
+<pre><code>dc=cluster,dc=example,dc=org
+├── ou=People    <- one posixAccount entry per user
+└── ou=Groups    <- one posixGroup entry per project/team/role</code></pre>
+<p>Resist the urge to nest deeply by department early on — it complicates ACLs and search filters for little benefit at cluster scale (a few hundred to low tens of thousands of accounts). If you need project-based access control, model it as group membership (<code>cn=proj-fusion</code>, <code>cn=proj-genomics</code>), not as DIT structure.</p>
+
+<h3>Step 3 — Configure TLS/LDAPS</h3>
+<p>Never run plaintext LDAP (port 389 without StartTLS) for authentication traffic in production — credentials and directory contents traverse the network in the clear otherwise. Enable LDAPS (port 636) or mandate StartTLS on port 389.</p>
+<pre><code># cn=config (OLC) example: point slapd at your cert material
+dn: cn=config
+changetype: modify
+replace: olcTLSCertificateFile
+olcTLSCertificateFile: /etc/openldap/certs/ldap-server.crt
+-
+replace: olcTLSCertificateKeyFile
+olcTLSCertificateKeyFile: /etc/openldap/certs/ldap-server.key
+-
+replace: olcTLSCACertificateFile
+olcTLSCACertificateFile: /etc/openldap/certs/ca.crt</code></pre>
+<pre><code># Apply it with ldapmodify
+ldapmodify -Y EXTERNAL -H ldapi:/// -f enable-tls.ldif
+
+# In /etc/sysconfig/slapd or the systemd unit, listen on LDAPS too:
+SLAPD_URLS="ldapi:/// ldap:/// ldaps:///"</code></pre>
+
+<h3>Step 4 — Verify with ldapsearch</h3>
+<pre><code># Anonymous search over LDAPS, verifying TLS + returning a user entry
+ldapsearch -H ldaps://ldap01.cluster.example.org \
+  -x -b "ou=People,dc=cluster,dc=example,dc=org" \
+  "(uid=jsmith)" uidNumber gidNumber homeDirectory loginShell
+
+# Authenticated bind test (prompts for password)
+ldapsearch -H ldaps://ldap01.cluster.example.org \
+  -D "uid=jsmith,ou=People,dc=cluster,dc=example,dc=org" -W \
+  -b "dc=cluster,dc=example,dc=org" "(objectClass=posixAccount)"</code></pre>
+
+<h3>Step 5 — Configure client nodes</h3>
+<p>Historically this meant editing <code>/etc/nsswitch.conf</code> to add <code>ldap</code> as a source and configuring <code>pam_ldap</code> / <code>nss-pam-ldapd</code> directly:</p>
+<pre><code># /etc/nsswitch.conf (legacy direct-LDAP approach)
+passwd:     files ldap
+group:      files ldap
+shadow:     files ldap</code></pre>
+<p>In practice, almost nobody points compute nodes at LDAP directly anymore — direct <code>pam_ldap</code>/<code>nss_ldap</code> has no local caching, so an LDAP hiccup or network partition means every login and every UID lookup on every node fails simultaneously. The modern, recommended path is to route through <strong>SSSD</strong> instead, which layers caching, offline auth, and connection failover on top of the same LDAP backend. That configuration — <code>sssd.conf</code>, <code>id_provider = ldap</code>, cache tuning, and integration with Slurm's UID lookups at job-launch scale — is covered in full in <a href="10-identity-sssd.html">Section 10 — SSSD Integration</a>.</p>
+
+<h3>Step 6 — Sync UID/GID ranges across the cluster</h3>
+<p>Reserve a UID/GID range for LDAP-managed accounts that never overlaps system/local accounts on any node image:</p>
+<pre><code># /etc/login.defs on every node image — keep local accounts out of the LDAP range
+UID_MIN   1000
+UID_MAX  60000
+# LDAP-managed human accounts start at 100000+
+# Service accounts (e.g. svc-slurm) sit in a separate reserved band, e.g. 400-999</code></pre>
+<p>Bake this into your golden node image / configuration management (Ansible, Warewulf, xCAT postscripts) so every node — provisioned today or reimaged next year — agrees on the same reserved bands from day one.</p>
+
+<h3>Step 7 — Integration with cluster management tools</h3>
+<p>If you're running a commercial or semi-commercial cluster manager, don't hand-wire LDAP against its grain:</p>
+<ul>
+<li><strong>Bright Cluster Manager (BCM)</strong> has built-in LDAP integration (<code>cmauth</code>/CMDaemon-managed OpenLDAP by default, or bind-to-external-LDAP mode) exposed through <code>cmsh</code> — use its native user-management module rather than editing <code>slapd.conf</code> by hand on a BCM head node.</li>
+<li><strong>xCAT</strong> expects identity to be handled by whatever OS-level mechanism you configure (typically SSSD) on the management and compute images; it doesn't ship its own directory but has documented patterns for syncing <code>/etc/passwd</code>-equivalent data during node deployment for sites that don't want a live LDAP dependency at node boot.</li>
+</ul>
+<p>Check your CM tool's own docs before improvising — most drama here comes from fighting the tool's assumptions about where identity "lives" rather than from LDAP itself.</p>
+
+<div class="callout warn">
+<strong>Common pitfalls</strong>
+<ul>
+<li><strong>UID/GID collisions.</strong> A node image with pre-existing local accounts (or a previous ad-hoc cluster) can collide with LDAP-assigned UIDs. Always audit <code>/etc/passwd</code> on your golden image before go-live and keep local/system UIDs strictly below your LDAP range.</li>
+<li><strong>Nested groups.</strong> Plain <code>posixGroup</code> has no native nesting — <code>memberUid</code> lists are flat. If you need "group of groups" semantics, you need <code>groupOfNames</code>/<code>groupOfUniqueNames</code> with recursive resolution, which not every consumer (including some old NSS/PAM stacks) understands. Test group-of-groups resolution explicitly before relying on it for Slurm QOS mapping.</li>
+<li><strong>Referral loops.</strong> Misconfigured <code>olcReferral</code> or chained referrals between replicas can cause clients to bounce between servers indefinitely, especially after a topology change. Disable unnecessary referrals on read replicas and test failover paths, not just the happy path.</li>
+<li><strong>LDAPS cert trust issues.</strong> A self-signed or internal-CA cert that isn't distributed to every node's trust store causes silent auth failures that look like "LDAP is down" when it's actually a TLS handshake rejection. Push your CA cert via configuration management to every node image, not just the ones you remembered to test on.</li>
+<li><strong>Clock skew.</strong> If you layer Kerberos on top later (FreeIPA does this by default), clocks more than ~5 minutes out of sync between a node and the KDC will silently break authentication. Get NTP/chrony solid before LDAP/Kerberos go live.</li>
+</ul>
+</div>
+
+<h2>Further Reading</h2>
+<ul>
+<li><a href="https://www.rfc-editor.org/rfc/rfc4511">RFC 4511 — Lightweight Directory Access Protocol (LDAP): The Protocol</a></li>
+<li><a href="https://www.openldap.org/doc/admin26/quickstart.html">OpenLDAP Software 2.6 Administrator's Guide: A Quick-Start Guide</a></li>
+<li><a href="https://www.openldap.org/doc/admin26/guide.html">OpenLDAP Software 2.6 Administrator's Guide (full)</a></li>
+<li><a href="https://www.zytrax.com/books/ldap/ch6/slapd-config.html">OpenLDAP using OLC (cn=config) — Zytrax LDAP Book</a></li>
+<li><a href="https://www.freeipa.org/page/Quick_Start_Guide">FreeIPA Quick Start Guide</a></li>
+<li><a href="https://www.freeipa.org/page/InstallAndDeploy">FreeIPA: Install and Deploy</a></li>
+<li><a href="https://freeipa.readthedocs.io/en/latest/workshop/1-server-install.html">FreeIPA Workshop — Unit 1: Installing the FreeIPA Server</a></li>
+<li><a href="https://docs.redhat.com/en/documentation/red_hat_enterprise_linux/8/html/configuring_authentication_and_authorization_in_rhel/configuring-sssd-to-use-ldap-and-require-tls-authentication_configuring-authentication-and-authorization-in-rhel">Red Hat RHEL 8 — Configuring SSSD to Use LDAP and Require TLS Authentication</a></li>
+<li><a href="https://sssd.io/docs/quick-start.html">sssd.io — SSSD Quick Start Guide</a></li>
+</ul>
+
+<div class="section-nav"><a href="08-scheduling.html">← Job Schedulers</a><a href="10-identity-sssd.html">Next: SSSD Integration →</a></div>
+</main></div>
+<footer><div class="wrap">Part of the HPC Cluster Build Guide.</div></footer>
+</body>
+</html>

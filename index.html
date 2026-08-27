@@ -1,0 +1,85 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>End-to-End HPC Cluster Build Guide</title>
+<link rel="stylesheet" href="assets/css/style.css">
+<style>
+.hero{padding:60px 0 20px;text-align:center}
+.hero h1{font-size:2.6rem;margin-bottom:.2em}
+.hero p{color:var(--text-dim);font-size:1.2rem;max-width:700px;margin:0 auto}
+.toclist{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin:32px 0}
+@media(max-width:800px){.toclist{grid-template-columns:1fr}}
+.tocitem{background:var(--panel);border:1px solid var(--border);border-radius:var(--radius);padding:18px 20px;text-decoration:none;color:var(--text);display:block;transition:border-color .15s}
+.tocitem:hover{border-color:var(--accent)}
+.tocitem .num{color:var(--accent);font-weight:700;font-size:13px;letter-spacing:.05em}
+.tocitem h3{margin:.3em 0;color:var(--text);font-size:1.05rem}
+.tocitem p{margin:0;color:var(--text-dim);font-size:.88rem}
+.grouphead{margin-top:40px;font-size:1.1rem;color:var(--accent2);border-bottom:1px solid var(--border);padding-bottom:6px}
+</style>
+</head>
+<body>
+<header class="top"><div class="wrap"><a href="index.html">HPC Cluster Build Guide</a><span class="badge">Public Edition</span></div></header>
+<div class="wrap">
+<div class="hero">
+<h1>End-to-End HPC Cluster Build Guide</h1>
+<p>From an empty rack to a production AI/HPC cluster with live users — hardware, fabric, storage, provisioning tools, schedulers, identity, onboarding, and monitoring, explained for a newcomer and detailed enough to actually build with.</p>
+</div>
+
+<div class="grouphead">Foundations</div>
+<div class="toclist">
+<a class="tocitem" href="sections/00-intro.html"><span class="num">00</span><h3>Introduction & The HPC Stack</h3><p>The layered mental model and cluster anatomy — start here.</p></a>
+<a class="tocitem" href="sections/01-compute-hardware.html"><span class="num">01</span><h3>Compute & Hardware</h3><p>CPUs, GPUs, NVLink/NVSwitch, node types, cooling.</p></a>
+<a class="tocitem" href="sections/02-networking-fabric.html"><span class="num">02</span><h3>Networking & Fabric</h3><p>InfiniBand, RoCE, RDMA, fat-tree/dragonfly topology.</p></a>
+<a class="tocitem" href="sections/03-storage.html"><span class="num">03</span><h3>Storage</h3><p>Lustre, GPFS/Spectrum Scale, BeeGFS, NFS, object storage.</p></a>
+</div>
+
+<div class="grouphead">Provisioning & Cluster Management Tools</div>
+<div class="toclist">
+<a class="tocitem" href="sections/04-provisioning-bcm.html"><span class="num">04</span><h3>NVIDIA Base Command Manager</h3><p>The commercial, all-in-one provisioning + monitoring stack.</p></a>
+<a class="tocitem" href="sections/05-provisioning-xcat.html"><span class="num">05</span><h3>xCAT</h3><p>Open-source management-node provisioning toolkit.</p></a>
+<a class="tocitem" href="sections/06-provisioning-warewulf-openhpc.html"><span class="num">06</span><h3>Warewulf + OpenHPC</h3><p>Lightweight stateless provisioning + curated OSS HPC stack.</p></a>
+<a class="tocitem" href="sections/07-provisioning-baremetal-ansible.html"><span class="num">07</span><h3>Roll-Your-Own: Bare-Metal + Ansible</h3><p>Full control with kickstart, Ansible, and no vendor CM tool.</p></a>
+</div>
+
+<div class="grouphead">Scheduling, Identity & Onboarding</div>
+<div class="toclist">
+<a class="tocitem" href="sections/08-scheduling.html"><span class="num">08</span><h3>Job Schedulers</h3><p>Slurm, PBS, and LSF — how workloads get allocated.</p></a>
+<a class="tocitem" href="sections/09-identity-ldap.html"><span class="num">09</span><h3>LDAP Integration</h3><p>What/why/where/when/how of centralized identity.</p></a>
+<a class="tocitem" href="sections/10-identity-sssd.html"><span class="num">10</span><h3>SSSD Integration</h3><p>The caching broker between nodes and your directory.</p></a>
+<a class="tocitem" href="sections/11-onboarding-dls.html"><span class="num">11</span><h3>User Onboarding & Distribution Lists</h3><p>DL-driven access, Slurm associations, Day-1 checklist.</p></a>
+</div>
+
+<div class="grouphead">Operations</div>
+<div class="toclist">
+<a class="tocitem" href="sections/12-monitoring.html"><span class="num">12</span><h3>Monitoring & Observability</h3><p>DCGM, Prometheus, Grafana, alerting.</p></a>
+<a class="tocitem" href="sections/13-end-to-end-build.html"><span class="num">13</span><h3>Full Build Walkthrough: Day 0 → Day N</h3><p>The capstone timeline tying every layer together.</p></a>
+</div>
+
+<div class="grouphead">Network Fabrics & Cloud Builds</div>
+<div class="toclist">
+<a class="tocitem" href="sections/14-network-fabrics-deep-dive.html"><span class="num">14</span><h3>Network Fabrics Deep-Dive</h3><p>InfiniBand NDR, RoCEv2, Slingshot, Omni-Path compared.</p></a>
+<a class="tocitem" href="sections/15-csp-aws.html"><span class="num">15</span><h3>CSP Build: AWS</h3><p>P5/P4d, EFA, ParallelCluster, FSx for Lustre.</p></a>
+<a class="tocitem" href="sections/16-csp-gcp.html"><span class="num">16</span><h3>CSP Build: GCP</h3><p>A3/A4, GPUDirect-TCPX, Cluster Toolkit.</p></a>
+<a class="tocitem" href="sections/17-csp-azure.html"><span class="num">17</span><h3>CSP Build: Azure</h3><p>ND-series, InfiniBand, CycleCloud.</p></a>
+<a class="tocitem" href="sections/18-csp-oci.html"><span class="num">18</span><h3>CSP Build: OCI</h3><p>Bare-metal GPU shapes, RDMA cluster networking.</p></a>
+<a class="tocitem" href="sections/19-csp-comparison.html"><span class="num">19</span><h3>CSP Comparison</h3><p>AWS vs GCP vs Azure vs OCI, side by side.</p></a>
+</div>
+
+<div class="grouphead">Infrastructure as Code</div>
+<div class="toclist">
+<a class="tocitem" href="sections/20-iac-terraform.html"><span class="num">20</span><h3>IaC: Terraform</h3><p>Declarative infra provisioning for the cluster layer.</p></a>
+<a class="tocitem" href="sections/21-iac-ansible-fullstack.html"><span class="num">21</span><h3>IaC: Ansible Full-Stack</h3><p>Dynamic inventory, full role stack, monitoring integration.</p></a>
+<a class="tocitem" href="sections/22-iac-puppet.html"><span class="num">22</span><h3>IaC: Puppet</h3><p>Pull-based config management, roles/profiles pattern.</p></a>
+</div>
+
+<div class="grouphead">Deeper Observability</div>
+<div class="toclist">
+<a class="tocitem" href="sections/23-observability-deep-dive.html"><span class="num">23</span><h3>Observability Deep-Dive</h3><p>Federation, Mimir/Thanos, DCGM internals, SLOs.</p></a>
+</div>
+
+</div>
+<footer><div class="wrap">HPC Cluster Build Guide — Public Edition. Sourced from NVIDIA docs, SchedMD, OpenLDAP/SSSD/FreeIPA, Lustre/GPFS/BeeGFS, xCAT, Warewulf/OpenHPC, and other public references cited per section.</div></footer>
+</body>
+</html>

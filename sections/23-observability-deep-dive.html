@@ -1,0 +1,147 @@
+<!DOCTYPE html>
+<html data-theme="dark">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>23 — Observability Deep-Dive: Metrics, Logs, Traces at Fleet Scale | HPC Cluster Build Guide</title>
+<link rel="stylesheet" href="../assets/css/style.css">
+</head>
+<body>
+<header class="top"><div class="wrap"><a href="../index.html">HPC Cluster Build Guide</a><span class="badge">Public Edition</span></div></header>
+<div class="wrap"><nav class="crumbs"><a href="22-iac-puppet.html">← IaC — Puppet</a></nav>
+<main>
+
+<h1>23 — Observability Deep-Dive: Metrics, Logs, Traces at Fleet Scale</h1>
+<p class="lede">Section 12 covered the basics — DCGM, Prometheus, Grafana on a single cluster. This section goes further: how observability holds together once you're running many clusters, many thousands of GPUs, and a metrics/logs pipeline that has itself become infrastructure you have to capacity-plan and operate.</p>
+
+<h2>The three pillars, applied to HPC</h2>
+<p>Observability is usually described as three pillars — metrics, logs, and traces — and each maps onto HPC slightly differently than it does in a typical web-service stack.</p>
+<div class="grid3">
+<div class="card"><h3>Metrics</h3><p>Numeric time series: GPU utilization, temperature, power, XID counts, fabric error counters, job queue depth. This is the pillar HPC leans on hardest — it's cheap to store, cheap to alert on, and DCGM already emits it natively.</p></div>
+<div class="card"><h3>Logs</h3><p>Unstructured or semi-structured text: <code>dmesg</code>/XID lines, <code>slurmctld</code>/<code>slurmd</code> daemon logs, syslog, driver messages. This is where the "why" behind a metric threshold crossing usually lives.</p></div>
+<div class="card"><h3>Traces</h3><p>The least common pillar in HPC. Distributed tracing was built for request-scoped microservices, and most HPC jobs aren't shaped like that — but it has a real, narrower role, covered below.</p></div>
+</div>
+<p>The practical shift at fleet scale isn't adding a new pillar — it's that each existing pillar stops being something one machine can hold. A single Prometheus server, a single Loki instance, and a single Grafana dashboard set all hit structural ceilings once you're running more than a handful of clusters.</p>
+
+<h2>Scaling Prometheus beyond one cluster</h2>
+<p>Prometheus was designed as a single-node, pull-based system, and that design holds up well within one cluster. Across clusters, two approaches exist, and they solve different problems.</p>
+<p><strong>Federation</strong> — one Prometheus server scrapes an aggregated <code>/federate</code> endpoint on other Prometheus servers — was the original answer, but it doesn't scale past a handful of clusters. It only pulls pre-aggregated series (not raw data), it adds its own scrape latency, and it was never designed as a global query layer. Most teams today treat federation as fine for small setups and a liability once you want raw multi-cluster queries, long retention, or a single pane of glass over dozens of clusters.</p>
+<p>The better-scaling pattern is <strong>remote_write</strong>: each cluster's Prometheus keeps doing what it's good at — scraping and short-term local storage — and continuously ships every sample to a horizontally scalable, object-storage-backed backend. The two dominant choices:</p>
+<div class="grid2">
+<div class="card"><h3>Grafana Mimir</h3><p>A "metrics warehouse" — Prometheus, Grafana Alloy, or an OpenTelemetry Collector remote-writes into it, and Mimir owns the write path, tenant limits, replication, long-term storage blocks, and query serving. Good fit for a new multi-team, multi-cluster platform built from scratch.</p></div>
+<div class="card"><h3>Thanos</h3><p>Extends Prometheus from the outside rather than replacing it — a sidecar uploads each Prometheus's TSDB blocks to object storage, and a Querier component federates queries across all of them plus a global store. Good fit when you already have a working per-cluster Prometheus fleet and want global query + long retention layered on top without ripping anything out.</p></div>
+</div>
+<p>Both give you a single PromQL endpoint across every cluster, which is what lets one Grafana dashboard show fabric-level utilization across five geographically separate clusters simultaneously. <strong>Sharding</strong> matters once ingestion volume grows: Mimir and Thanos Receive both support horizontally sharding the write path across multiple ingester replicas, keyed by tenant or by series hash, so no single ingestion node becomes the bottleneck as node count grows into the thousands.</p>
+
+<h2>DCGM deep dive: field IDs and diagnostic levels</h2>
+<p>Every metric DCGM exposes is addressed by a numeric <strong>field ID</strong> (for example, <code>DCGM_FI_DEV_GPU_UTIL</code> is field 203, <code>DCGM_FI_DEV_GPU_TEMP</code> is field 150). dcgm-exporter's default and custom metric-list files simply enumerate which field IDs to scrape and expose — this is the mechanism that lets an operator add NVLink or NVSwitch topology counters to Prometheus without touching DCGM itself, just the exporter's config map.</p>
+<p>DCGM's active diagnostic (<code>dcgmi diag -r &lt;level&gt;</code>) runs at four increasing levels of intrusiveness:</p>
+<table>
+<tr><th>Level</th><th>Approx. duration</th><th>When to run it</th></tr>
+<tr><td>1</td><td>&lt; 2.5 seconds</td><td>Quick readiness check — safe to run before every job dispatch</td></tr>
+<tr><td>2</td><td>~2.5–10 minutes (4 vs 8 GPU systems)</td><td>Post-failure epilogue — run automatically after a job fails or a node throws an XID</td></tr>
+<tr><td>3</td><td>~5 minutes (includes End User Diagnostics)</td><td>Administrator-run post-mortem, typically during node draining</td></tr>
+<tr><td>4</td><td>~20 minutes</td><td>Deepest stress test — used to clear a node for RMA or confirm a suspected marginal GPU</td></tr>
+</table>
+<p>NVLink and NVSwitch topology metrics (link bandwidth, CRC error counts, replay counters) are exposed through their own field IDs as well, and are what let a fabric-health dashboard distinguish "this node's aggregate NVLink bandwidth dropped" from "one specific link on one specific NVSwitch is degraded" — a distinction that matters enormously for multi-node NVLink-domain training jobs where a single bad link can silently bottleneck an entire job.</p>
+
+<h2>Where distributed tracing fits in HPC</h2>
+<p>Classic distributed tracing (Jaeger, Zipkin, OpenTelemetry traces) exists to follow a single request as it hops across dozens of microservices. Most HPC workloads — a multi-day training job holding a fixed GPU allocation — don't have that request-scoped shape, which is why tracing is the least-adopted pillar here. But it does have a real niche: profiling <strong>collective communication</strong> inside a distributed training job. Tools like NVIDIA Nsight Systems and NCCL's own profiling hooks can produce trace-like timelines showing exactly how long each rank spent in an all-reduce, where stragglers appear, and whether a specific node's NVLink or IB path is the one holding up the whole collective. It's a narrower, HPC-flavored form of tracing — span-per-collective-op rather than span-per-microservice-hop — but the underlying idea (causally-ordered timing data instead of aggregated metrics) is the same.</p>
+
+<h2>Log aggregation and correlating a single job</h2>
+<p>The hard part of log aggregation at fleet scale isn't ingestion — it's correlation. A single degraded-node incident can be scattered across <code>slurmctld</code>'s log (job was scheduled here), <code>slurmd</code>'s log on the node (job started, then the node was drained), <code>dmesg</code>/syslog (the actual XID event), and DCGM's own event stream — four sources, one incident, and no shared identifier unless the pipeline is built to carry one through. <strong>Structured logging</strong> — every log line emitted as JSON with consistent fields like <code>job_id</code>, <code>node</code>, <code>cluster</code>, and <code>timestamp</code> — is what makes that correlation a single query instead of four manual greps across four machines.</p>
+<p><a href="https://grafana.com/docs/loki/latest/" target="_blank" rel="noopener">Grafana Loki</a> and the ELK/OpenSearch stack solve this the same way conceptually but at different cost points: Loki indexes only labels (not full text), which keeps storage cheap and pairs naturally with a Prometheus/Grafana stack already using the same label model; ELK/OpenSearch indexes full text, which costs more to store and run but supports richer ad-hoc search — a better fit when logs also need to serve security or audit investigations.</p>
+
+<h2>SLOs and SLIs for a GPU fleet</h2>
+<p>Borrowing from the SRE discipline: an <strong>SLI</strong> is a measured indicator (a ratio of good outcomes to total valid outcomes), an <strong>SLO</strong> is the target value for that indicator, and an <strong>error budget</strong> is simply 1 minus the SLO — the amount of "badness" you're allowed before you're out of compliance. A few SLIs that map cleanly onto a GPU fleet:</p>
+<table>
+<tr><th>SLI</th><th>Example SLO</th><th>What it protects against</th></tr>
+<tr><td>GPU availability %</td><td>99.5% of allocated GPU-hours are on healthy, non-drained GPUs</td><td>Silent capacity loss from drained/failed nodes</td></tr>
+<tr><td>Job success rate</td><td>99% of jobs complete without an infrastructure-caused failure</td><td>Distinguishes user code bugs from platform reliability</td></tr>
+<tr><td>Mean time to detect (MTTD) a degraded node</td><td>&lt; 5 minutes from first anomalous signal to alert fired</td><td>Time a bad node sits in the scheduling pool silently wasting GPU-hours</td></tr>
+</table>
+
+<h2>Reference architecture</h2>
+<svg class="diagram" viewBox="0 0 900 380" xmlns="http://www.w3.org/2000/svg">
+  <style>
+    .box{fill:#1a2437;stroke:#25324a;stroke-width:1.5}
+    .accent{fill:#141c2b;stroke:#76b900;stroke-width:2}
+    .accent2{fill:#141c2b;stroke:#4fc3f7;stroke-width:2}
+    .lbl{fill:#e8edf4;font-family:sans-serif;font-size:13px;text-anchor:middle}
+    .sub{fill:#9fb0c3;font-family:sans-serif;font-size:11px;text-anchor:middle}
+    .arrow{stroke:#4fc3f7;stroke-width:2;fill:none;marker-end:url(#arrowhead2)}
+  </style>
+  <defs>
+    <marker id="arrowhead2" markerWidth="10" markerHeight="8" refX="8" refY="4" orient="auto">
+      <polygon points="0 0, 10 4, 0 8" fill="#4fc3f7"/>
+    </marker>
+  </defs>
+
+  <rect x="20" y="30" width="170" height="60" rx="8" class="box"/>
+  <text x="105" y="55" class="lbl">Cluster A</text>
+  <text x="105" y="73" class="sub">Prometheus + Loki (local)</text>
+
+  <rect x="20" y="110" width="170" height="60" rx="8" class="box"/>
+  <text x="105" y="135" class="lbl">Cluster B</text>
+  <text x="105" y="153" class="sub">Prometheus + Loki (local)</text>
+
+  <rect x="20" y="190" width="170" height="60" rx="8" class="box"/>
+  <text x="105" y="215" class="lbl">Cluster N</text>
+  <text x="105" y="233" class="sub">Prometheus + Loki (local)</text>
+
+  <rect x="260" y="60" width="180" height="70" rx="8" class="accent2"/>
+  <text x="350" y="88" class="lbl">Mimir / Thanos</text>
+  <text x="350" y="106" class="sub">remote_write, global query, object storage</text>
+
+  <rect x="260" y="160" width="180" height="70" rx="8" class="accent2"/>
+  <text x="350" y="188" class="lbl">Loki (central)</text>
+  <text x="350" y="206" class="sub">multi-cluster log aggregation</text>
+
+  <line x1="190" y1="60" x2="260" y2="90" class="arrow"/>
+  <line x1="190" y1="140" x2="260" y2="120" class="arrow"/>
+  <line x1="190" y1="220" x2="260" y2="180" class="arrow"/>
+
+  <rect x="520" y="30" width="170" height="60" rx="8" class="accent"/>
+  <text x="605" y="55" class="lbl">Grafana</text>
+  <text x="605" y="73" class="sub">cross-cluster dashboards</text>
+
+  <rect x="520" y="110" width="170" height="60" rx="8" class="box"/>
+  <text x="605" y="135" class="lbl">Alertmanager</text>
+  <text x="605" y="153" class="sub">SLO burn-rate alerts</text>
+
+  <line x1="440" y1="95" x2="520" y2="60" class="arrow"/>
+  <line x1="440" y1="195" x2="520" y2="145" class="arrow"/>
+  <line x1="440" y1="95" x2="520" y2="140" class="arrow"/>
+
+  <rect x="720" y="70" width="150" height="60" rx="8" class="box"/>
+  <text x="795" y="95" class="lbl">PagerDuty / Slack</text>
+  <text x="795" y="113" class="sub">on-call paging</text>
+
+  <line x1="690" y1="140" x2="720" y2="105" class="arrow"/>
+
+  <rect x="20" y="290" width="850" height="60" rx="8" class="box"/>
+  <text x="445" y="315" class="lbl">Every metric and log line carries cluster/node/job_id labels — the join key across the whole pipeline</text>
+  <text x="445" y="333" class="sub">This shared label scheme is what turns N separate dashboards into one queryable fleet</text>
+</svg>
+<p>Each cluster keeps its own short-term Prometheus and Loki for local resilience — a network partition to the central backend shouldn't blind local operators to a local fire — while a central Mimir/Thanos and Loki pair provides the long-term, cross-cluster query surface that a single Grafana instance and a single Alertmanager sit on top of.</p>
+
+<h2>Capacity planning the observability stack itself</h2>
+<p>The observability stack is infrastructure too, and it needs its own capacity plan. As a rough planning heuristic: a GPU node emitting ~200 active DCGM series plus ~50 node-level series, scraped every 15 seconds, generates roughly 15-20 samples/second per node. At 2,000 nodes that's on the order of 30,000-40,000 samples/second flowing into <code>remote_write</code> — well within a modestly-sized Mimir or Thanos ingester tier, but the number to watch isn't raw throughput, it's <strong>cardinality</strong>: every additional label value (per-GPU, per-job, per-NVLink-port) multiplies the series count, and storage/memory cost scales with active series far more than with sample rate. Log volume is harder to estimate generically — it depends heavily on log verbosity settings — but a fleet-wide Loki deployment sized for a few hundred MB/day per 100 nodes of structured logs is a reasonable starting point to validate against actual ingestion once agents are deployed.</p>
+
+<h2>Further Reading</h2>
+<ul>
+<li><a href="https://docs.nvidia.com/datacenter/dcgm/latest/user-guide/dcgm-diagnostics.html" target="_blank" rel="noopener">NVIDIA DCGM Diagnostics documentation</a></li>
+<li><a href="https://prometheus.io/docs/prometheus/latest/federation/" target="_blank" rel="noopener">Prometheus Federation documentation</a></li>
+<li><a href="https://prometheus.io/docs/prometheus/latest/storage/#remote-storage-integrations" target="_blank" rel="noopener">Prometheus remote_write / remote storage integrations</a></li>
+<li><a href="https://grafana.com/docs/mimir/latest/" target="_blank" rel="noopener">Grafana Mimir documentation</a></li>
+<li><a href="https://thanos.io/tip/thanos/quick-tutorial.md/" target="_blank" rel="noopener">Thanos documentation</a></li>
+<li><a href="https://grafana.com/docs/loki/latest/" target="_blank" rel="noopener">Grafana Loki documentation</a></li>
+<li><a href="https://sre.google/sre-book/service-level-objectives/" target="_blank" rel="noopener">Google SRE Book — Service Level Objectives</a></li>
+<li><a href="https://sre.google/workbook/implementing-slos/" target="_blank" rel="noopener">Google SRE Workbook — Implementing SLOs</a></li>
+</ul>
+
+<div class="section-nav"><a href="22-iac-puppet.html">← IaC — Puppet</a><a href="../index.html">Back to Index →</a></div>
+</main></div>
+<footer><div class="wrap">Part of the HPC Cluster Build Guide.</div></footer>
+</body>
+</html>

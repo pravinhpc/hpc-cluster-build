@@ -1,0 +1,193 @@
+<!DOCTYPE html>
+<html data-theme="dark">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>16 — CSP Build: Google Cloud (GCP) | HPC Cluster Build Guide</title>
+<link rel="stylesheet" href="../assets/css/style.css">
+</head>
+<body>
+<header class="top"><div class="wrap"><a href="../index.html">HPC Cluster Build Guide</a><span class="badge">Public Edition</span></div></header>
+<div class="wrap"><nav class="crumbs"><a href="15-csp-aws.html">← CSP Build — AWS</a></nav>
+<main>
+
+<h1>16 — CSP Build: Google Cloud (GCP)</h1>
+<p class="lede">Everything earlier in this guide assumed you own the racks. Google Cloud gives you a different path to the same end state — a Slurm-scheduled fleet of GPU nodes with a fast interconnect and shared storage — where the "racking and cabling" step is replaced by API calls and a YAML file. This section covers the GPU instance families GCP offers, the GPUDirect-TCPX/TCPXO networking stack that stands in for InfiniBand, and Cluster Toolkit, Google's purpose-built tool for standing up an HPC/AI cluster on top of it.</p>
+
+<h2>GPU instance families</h2>
+<p>GCP's accelerator-optimized machine family maps roughly onto three generations of NVIDIA GPU:</p>
+<ul>
+  <li><strong>A2</strong> — NVIDIA A100 GPUs (40GB or 80GB variants), the oldest of the three families still in active use for training and inference workloads that don't need the newer interconnect.</li>
+  <li><strong>A3 family</strong> — NVIDIA H100 GPUs, split into several machine types with different networking capability: <code>a3-highgpu-8g</code> and <code>a3-edgegpu-8g</code> (8× H100, GPUDirect-TCPX), and <code>a3-megagpu-8g</code> (8× H100, higher-bandwidth NICs, GPUDirect-TCPXO). There is also an A3 Ultra tier built around H200 GPUs with RDMA-capable networking.</li>
+  <li><strong>A4</strong> — NVIDIA B200 GPUs, GCP's current-generation Blackwell offering, using GPUDirect-RDMA rather than the TCPX variants. A GB200 NVL72-based tier (A4X / A4X Max) also exists for the largest training jobs.</li>
+</ul>
+<p>The practical decision usually comes down to what your framework and interconnect requirements are: A2 is the cheapest entry point if you're on A100-class workloads already, A3 Mega is the common choice for large-scale H100 training where NCCL bandwidth actually matters, and A4 is where you land if you need B200/Blackwell-class compute and are willing to work within GCP's current regional capacity constraints.</p>
+
+<h2>GPUDirect-TCPX / TCPXO: GCP's RDMA-like fabric</h2>
+<p>Bare-metal HPC clusters use InfiniBand or RoCE with true RDMA to let GPUs on different nodes exchange data without involving the host CPU. GCP's A3 VMs are virtualized and don't expose raw RDMA hardware to the guest, so Google built <strong>GPUDirect-TCPX</strong> (and its successor <strong>GPUDirect-TCPXO</strong>) as a software-offloaded networking stack that gets most of the same benefit over standard Ethernet NICs:</p>
+<ul>
+  <li><strong>GPUDirect-TCPX</strong> — used on <code>a3-highgpu-8g</code> and <code>a3-edgegpu-8g</code>. An optimized TCP path that reduces CPU involvement and latency compared to vanilla TCP, using a userspace networking layer alongside the standard NIC driver.</li>
+  <li><strong>GPUDirect-TCPXO</strong> — used on <code>a3-megagpu-8g</code>, GCP's newer, more fully offloaded evolution of the same idea, paired with higher-bandwidth NICs, and generally what you want for large multi-node NCCL collectives.</li>
+  <li><strong>GPUDirect RDMA</strong> — the A4 (B200) generation moves to genuine RDMA-based GPUDirect rather than a TCP-offload variant, closer in spirit to on-prem RoCE.</li>
+</ul>
+<p>In practice this stack is not something you hand-roll: both GKE and Cluster Toolkit ship pre-built modules, NCCL plugins, and receive-side-scaling configuration that wire GPUDirect-TCPX/TCPXO up correctly for you, because the setup — extra NICs, specific driver versions, NCCL plugin versions that must match — is fiddly enough that getting it wrong silently degrades your collective bandwidth rather than failing outright.</p>
+
+<h2>GCP Cluster Toolkit</h2>
+<p><strong>Cluster Toolkit</strong> (formerly Cloud HPC Toolkit) is Google's open-source tool for building GCP HPC/AI clusters from a declarative blueprint, analogous to how this guide uses BCM, xCAT, or Warewulf on bare metal. It's built on top of Terraform and Packer: you write a YAML "blueprint" describing the network, storage, and compute you want, and the toolkit's <code>gcluster</code> CLI expands that blueprint into Terraform modules and deploys them.</p>
+<p>A blueprint is organized around a small set of concepts:</p>
+<ul>
+  <li><strong>Deployment groups</strong> — ordered stages of the deployment (e.g. network first, then storage, then the Slurm cluster itself), each backed by its own Terraform state.</li>
+  <li><strong>Modules</strong> — reusable building blocks (a VPC, a Filestore instance, a Slurm login node, a Slurm nodeset/partition) that Google maintains in the Cluster Toolkit repository and that you reference and configure with variables.</li>
+  <li><strong>Variables and outputs</strong> — modules pass values to each other (a network module's output feeds into the compute module's input), so the blueprint reads like a wiring diagram rather than a flat parameter list.</li>
+</ul>
+<p>Under the hood, Cluster Toolkit's Slurm modules deploy the <strong>Slurm on Google Cloud</strong> scheduler integration, which uses a controller VM plus dynamically-provisioned (or statically-reserved) compute nodesets — so GPU nodes can either stay running for a reservation-backed cluster or spin up and down per job via GCP's autoscaling APIs.</p>
+
+<h2>Storage: Filestore and Parallelstore</h2>
+<p>GCP offers two managed file storage options that show up constantly in Cluster Toolkit blueprints:</p>
+<ul>
+  <li><strong>Filestore</strong> — managed NFS, the default choice for home directories, shared scripts, and general-purpose shared storage. Simple to provision and mount, but its throughput ceiling is well below what large multi-node GPU training jobs need for dataset I/O.</li>
+  <li><strong>Parallelstore</strong> — a managed parallel file system (built on DAOS) purpose-built for HPC/AI throughput, striping data across multiple storage servers so aggregate bandwidth scales with capacity — hundreds of GB/s is achievable, versus the much lower ceiling on Filestore or Cloud Storage FUSE.</li>
+</ul>
+<p>The common pattern: Filestore for <code>/home</code> and configuration, Parallelstore (or Cloud Storage with FUSE/hierarchical namespace, for read-heavy checkpoint/dataset access) for the actual training data path.</p>
+
+<h2>Networking and IAM basics</h2>
+<p>A Cluster Toolkit deployment needs a VPC with subnets for the control plane and — on A3/A4 machine types — additional subnets dedicated to the GPUDirect-TCPX/TCPXO NICs (these machine types attach multiple NICs per VM specifically for the offloaded networking path). Firewall rules need to permit intra-cluster traffic on the compute subnet(s) and the outbound access your nodes need for package installs, container pulls, and license servers. On the identity side, the deployment uses a dedicated service account with the IAM roles Cluster Toolkit's modules require (Compute Admin-equivalent permissions, Filestore/Parallelstore admin, and Cloud Storage access for images/state) — scoped to a project rather than granted broadly, same as any production cloud deployment.</p>
+
+<h2>Step-by-step: building a Slurm cluster with Cluster Toolkit</h2>
+
+<div class="card">
+<h3>Step 1 — Install Cluster Toolkit and set up the project</h3>
+<p>Clone the <code>cluster-toolkit</code> repository, build the <code>gcluster</code> binary (Go-based), and authenticate to your GCP project with <code>gcloud auth application-default login</code>. Enable the required APIs (Compute Engine, Filestore, Parallelstore if used, IAM) on the target project.</p>
+</div>
+
+<div class="card">
+<h3>Step 2 — Write or adapt a blueprint</h3>
+<p>Google publishes ready-made example blueprints for common shapes (A3 Mega, A3 Ultra, A3 High Slurm clusters) that you copy and adjust rather than writing from scratch. A minimal GPU-cluster blueprint looks like this:</p>
+<pre><code>blueprint_name: gcp-a3mega-slurm
+
+vars:
+  project_id: my-gcp-project
+  deployment_name: a3mega-cluster
+  region: us-central1
+  zone: us-central1-a
+
+deployment_groups:
+- group: primary
+  modules:
+  - id: network
+    source: modules/network/vpc
+
+  - id: gpunets
+    source: modules/network/multivpc
+    settings:
+      network_count: 8
+
+  - id: homefs
+    source: modules/file-system/filestore-instance
+    use: [network]
+    settings:
+      local_mount: /home
+
+  - id: a3mega_nodeset
+    source: community/modules/compute/schedmd-slurm-gcp-v6-nodeset
+    use: [network, gpunets]
+    settings:
+      machine_type: a3-megagpu-8g
+      node_count_static: 8
+      bandwidth_tier: gvnic_enabled
+
+  - id: a3mega_partition
+    source: community/modules/compute/schedmd-slurm-gcp-v6-partition
+    use: [a3mega_nodeset]
+    settings:
+      partition_name: a3mega
+
+  - id: slurm_controller
+    source: community/modules/scheduler/schedmd-slurm-gcp-v6-controller
+    use: [network, a3mega_partition, homefs]
+</code></pre>
+</div>
+
+<div class="card">
+<h3>Step 3 — Deploy</h3>
+<p>Create a deployment variable file, then run <code>gcluster deploy</code> pointing at both files:</p>
+<pre><code>gcluster deploy -d a3mega-deployment.yaml gcp-a3mega-slurm.yaml --auto-approve</code></pre>
+<p>Cluster Toolkit expands the blueprint into Terraform, applies each deployment group in order, and reports progress; a Slurm cluster of this shape typically takes on the order of 30-40 minutes end to end, most of it in image and node provisioning.</p>
+</div>
+
+<div class="card">
+<h3>Step 4 — Verify and submit a job</h3>
+<p>SSH to the login/controller node, confirm nodes are visible with <code>sinfo</code>, and submit a small GPU job with <code>srun</code>/<code>sbatch</code> to confirm scheduling and GPUDirect-TCPXO are working before scaling up dataset size or job count.</p>
+</div>
+
+<h2>Diagram: Cluster Toolkit provisioning flow</h2>
+<svg class="diagram" viewBox="0 0 900 320" xmlns="http://www.w3.org/2000/svg">
+  <style>
+    .lbl{font-family:sans-serif;font-size:13px;fill:#e8edf4}
+    .lbl2{font-family:sans-serif;font-size:11px;fill:#9fb0c3}
+    .box{fill:#1a2437;stroke:#25324a;stroke-width:1.5}
+    .accent{fill:#141c2b;stroke:#76b900;stroke-width:2}
+    .arrow{stroke:#76b900;stroke-width:2;fill:none;marker-end:url(#arrow)}
+  </style>
+  <defs>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#76b900"/>
+    </marker>
+  </defs>
+  <rect x="20" y="20" width="860" height="280" fill="#0d1420" stroke="#25324a"/>
+
+  <rect x="50" y="50" width="160" height="55" rx="8" class="accent"/>
+  <text x="130" y="72" text-anchor="middle" class="lbl" font-weight="bold">Blueprint YAML</text>
+  <text x="130" y="90" text-anchor="middle" class="lbl2">network + storage + Slurm</text>
+
+  <rect x="270" y="50" width="160" height="55" rx="6" class="box"/>
+  <text x="350" y="72" text-anchor="middle" class="lbl">gcluster CLI</text>
+  <text x="350" y="90" text-anchor="middle" class="lbl2">expands blueprint</text>
+
+  <rect x="490" y="50" width="160" height="55" rx="6" class="box"/>
+  <text x="570" y="72" text-anchor="middle" class="lbl">Terraform modules</text>
+  <text x="570" y="90" text-anchor="middle" class="lbl2">per deployment group</text>
+
+  <rect x="710" y="50" width="140" height="55" rx="6" class="box"/>
+  <text x="780" y="72" text-anchor="middle" class="lbl">GCP APIs</text>
+  <text x="780" y="90" text-anchor="middle" class="lbl2">Compute/Filestore/IAM</text>
+
+  <line x1="210" y1="77" x2="265" y2="77" class="arrow"/>
+  <line x1="430" y1="77" x2="485" y2="77" class="arrow"/>
+  <line x1="650" y1="77" x2="705" y2="77" class="arrow"/>
+
+  <rect x="100" y="180" width="180" height="50" rx="6" class="box"/>
+  <text x="190" y="200" text-anchor="middle" class="lbl2">VPC + GPUDirect</text>
+  <text x="190" y="216" text-anchor="middle" class="lbl2">subnets provisioned</text>
+
+  <rect x="360" y="180" width="180" height="50" rx="6" class="box"/>
+  <text x="450" y="200" text-anchor="middle" class="lbl2">Filestore/Parallelstore</text>
+  <text x="450" y="216" text-anchor="middle" class="lbl2">mounted</text>
+
+  <rect x="620" y="180" width="180" height="50" rx="6" class="accent"/>
+  <text x="710" y="200" text-anchor="middle" class="lbl" font-weight="bold">Slurm controller + nodes</text>
+  <text x="710" y="216" text-anchor="middle" class="lbl2">ready for sinfo/srun</text>
+
+  <line x1="780" y1="105" x2="190" y2="180" class="arrow"/>
+  <line x1="780" y1="105" x2="450" y2="180" class="arrow"/>
+  <line x1="780" y1="105" x2="710" y2="180" class="arrow"/>
+
+  <text x="450" y="265" text-anchor="middle" class="lbl2">Typical time: 30-40 minutes for an A3 Mega-class blueprint, most of it in image/node provisioning.</text>
+</svg>
+
+<h2>Further Reading</h2>
+<ul>
+  <li><a href="https://docs.cloud.google.com/cluster-toolkit/docs/deploy/slurm/deploy-a3-mega-cluster" target="_blank" rel="noopener">Deploy an A3 Mega Slurm cluster for ML training — Cluster Toolkit docs</a></li>
+  <li><a href="https://github.com/GoogleCloudPlatform/cluster-toolkit/blob/main/examples/machine-learning/a3-megagpu-8g/a3mega-slurm-blueprint.yaml" target="_blank" rel="noopener">Example A3 Mega Slurm blueprint YAML — GoogleCloudPlatform/cluster-toolkit on GitHub</a></li>
+  <li><a href="https://docs.cloud.google.com/compute/docs/gpus/gpudirect" target="_blank" rel="noopener">Create an A3 Mega, A3 High, or A3 Edge instance with GPUDirect enabled</a></li>
+  <li><a href="https://docs.cloud.google.com/cluster-toolkit/docs/machine-learning/a3-mega-enable-gpudirect-tcpxo" target="_blank" rel="noopener">Enable GPUDirect-TCPXO optimized NCCL communication — Cluster Toolkit docs</a></li>
+  <li><a href="https://docs.cloud.google.com/ai-hypercomputer/docs/gpu" target="_blank" rel="noopener">GPU machine types — AI Hypercomputer docs</a></li>
+  <li><a href="https://cloud.google.com/blog/products/storage-data-transfer/parallelstore-high-performance-file-service-for-hpc-and-ai-is-ga" target="_blank" rel="noopener">Parallelstore high-performance file service for HPC and AI is GA — Google Cloud Blog</a></li>
+</ul>
+
+<div class="section-nav"><a href="15-csp-aws.html">← CSP Build — AWS</a><a href="17-csp-azure.html">Next: CSP Build — Azure →</a></div>
+</main>
+</div>
+<footer><div class="wrap">Part of the HPC Cluster Build Guide.</div></footer>
+</body>
+</html>

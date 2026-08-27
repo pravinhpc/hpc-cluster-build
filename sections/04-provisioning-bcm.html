@@ -1,0 +1,328 @@
+<!DOCTYPE html>
+<html data-theme="dark" lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>04 — Cluster Provisioning with NVIDIA Base Command Manager (BCM) | HPC Cluster Build Guide</title>
+<link rel="stylesheet" href="../assets/css/style.css">
+</head>
+<body>
+<header class="top"><div class="wrap"><a href="../index.html">HPC Cluster Build Guide</a><span class="badge">Public Edition</span></div></header>
+<div class="wrap"><nav class="crumbs"><a href="03-storage.html">← Storage</a></nav>
+<main>
+
+<h1>04 — Cluster Provisioning with NVIDIA Base Command Manager (BCM)</h1>
+<p class="lede">You've racked the nodes, wired the network, and built the storage. Now you need to turn a room full of bare, blank servers into one coherent, working cluster — with the same OS, the same drivers, the same workload manager, on every node, automatically. That's the job of a provisioning system, and NVIDIA Base Command Manager (BCM) is the tool this guide uses to do it.</p>
+
+<h2>What BCM is</h2>
+<p>Base Command Manager is NVIDIA's commercial cluster management product. It was originally an independent company's product called <strong>Bright Cluster Manager</strong>; NVIDIA acquired Bright Computing in 2022 and rebranded the software as Base Command Manager (BCM), folding it into the broader NVIDIA Base Command / Mission Control software family used to stand up DGX SuperPOD and similar AI factory deployments. Under the new name the core architecture is unchanged, so almost everything written about "Bright Cluster Manager" online — commands, log files, directory paths — still applies to BCM.</p>
+<p>What makes BCM useful is that it collapses several jobs that would otherwise be separate tools into one product:</p>
+<ul>
+  <li><strong>Bare-metal provisioning</strong> — PXE-boot new nodes and install a full OS image on them with zero manual OS installs.</li>
+  <li><strong>Software stack management</strong> — a "software image" (a golden root filesystem) is defined once and pushed to every node in a category, so drift between nodes disappears.</li>
+  <li><strong>Configuration management</strong> — network settings, kernel modules, BIOS/BMC settings, and workload-manager roles are all assigned centrally and enforced continuously.</li>
+  <li><strong>Monitoring and health checking</strong> — built-in metrics collection, alerting, and Node Health Check (NHC) style checks that can automatically drain a sick node from the scheduler.</li>
+  <li><strong>User and identity management</strong> — local user database with LDAP integration for centralized authentication.</li>
+</ul>
+<p>The alternative is stitching together Cobbler or MAAS for provisioning, Ansible for configuration, Ganglia or Prometheus for monitoring, and FreeIPA for identity — which works, but is a lot more moving parts to keep in sync. BCM's value proposition is "one console, one data model, one place things can go wrong (or right)."</p>
+
+<div class="callout tip">
+<div class="label">Where this fits in the build</div>
+By this point in the guide you should already have: physical racking and power (guide 01), a working leaf-spine or fat-tree network with a dedicated provisioning/management VLAN (guide 02), and shared storage reachable from every rack (guide 03). BCM sits on top of all of that — it doesn't replace your network or storage, it configures nodes to use them correctly.
+</div>
+
+<h2>Core concepts</h2>
+
+<h3>Head node</h3>
+<p>The <strong>head node</strong> (sometimes called the management node) is where BCM itself runs. It's the only node in the cluster you install an OS on by hand — every other node gets its OS from the head node over the network. The head node runs the BCM software stack, holds the CMDaemon database, serves DHCP/PXE/TFTP on the internal provisioning network, and is usually also where Slurm's controller (<code>slurmctld</code>) and the license/monitoring services live. Production clusters typically run head nodes in an active-passive high-availability pair so a single head node failure doesn't take down provisioning or job scheduling.</p>
+
+<h3>Node categories and software images</h3>
+<p>A <strong>software image</strong> is a complete root filesystem — kernel, drivers, libraries, GPU/CUDA stack, Slurm client binaries, monitoring agents — stored on the head node (or on shared storage) as a template. A <strong>node category</strong> is a group of nodes that share the same software image, the same kernel modules, the same disk layout, and the same roles (e.g. "gpu-compute", "cpu-compute", "login"). Instead of configuring 500 nodes individually, you configure one category and every node that belongs to it inherits the settings. Node-specific overrides (a MAC address, an IP, a specific BIOS setting) live at the individual node level and win over category defaults.</p>
+
+<h3>cmsh and Base View</h3>
+<p>BCM exposes two administrative interfaces over the same underlying object model:</p>
+<ul>
+  <li><strong>cmsh</strong> — a scriptable command-line shell (think of it as a cluster-aware, hierarchical CLI similar to a network switch's config mode). This is what you use for automation, batch changes, and anything you want to keep in a script or git repo.</li>
+  <li><strong>Base View</strong> (formerly Bright View) — a web GUI covering the same functionality, useful for browsing state, monitoring dashboards, and one-off changes.</li>
+</ul>
+<p>Both talk to the same backend process, <strong>CMDaemon</strong>, described next — so a change made in cmsh shows up in Base View instantly and vice versa.</p>
+
+<h3>CMDaemon</h3>
+<p>CMDaemon is the management daemon that is the actual brain of BCM. A full CMDaemon runs on the head node holding the authoritative cluster configuration database; a lightweight CMDaemon also runs on every regular node, reporting metrics and health status back to the head node and applying configuration changes pushed down to it. cmsh, Base View, and the REST/Python API are all just clients talking to CMDaemon — there's no separate "provisioning service" and "monitoring service" to keep in sync, it's one daemon with one data model.</p>
+
+<h3>The node-installer and PXE boot flow</h3>
+<p>This is the mechanism that actually gets a blank server running the right OS. In short: a node powers on, PXE-boots a small Linux environment from the head node, that environment (the <strong>node-installer</strong>) figures out which category the node belongs to, downloads the matching software image, writes it to local disk (or configures diskless/NFS-root boot), and then hands off to the real kernel to boot the installed OS. Full detail is in the walkthrough below.</p>
+
+<h2>Step-by-step: building a cluster with BCM from scratch</h2>
+
+<div class="card">
+<h3>Step 1 — Install the head node</h3>
+<p>BCM ships as an ISO/installer that you run on the machine that will become the head node, on top of a supported base OS (RHEL/Rocky or Ubuntu, depending on the BCM release). During installation you specify:</p>
+<ul>
+  <li>The internal cluster network range (the provisioning/management network your compute nodes will PXE-boot on).</li>
+  <li>The head node's own hostname and network interfaces (external/site network vs. internal cluster network).</li>
+  <li>Which base distribution image to install as the default software image for compute nodes (BCM includes ready-made images to start from).</li>
+  <li>License details and, for HA setups, the passive head node.</li>
+</ul>
+<p>At the end of this step you have one fully working Linux server running CMDaemon, DHCP, TFTP, and a provisioning HTTP(S) service — but zero compute nodes yet.</p>
+</div>
+
+<div class="card">
+<h3>Step 2 — Define node categories and software images</h3>
+<p>Next you decide how many distinct "types" of node you have — typically at least <code>gpu-compute</code>, maybe a separate <code>cpu-compute</code>, a <code>login</code> category, and sometimes a <code>storage-gateway</code> category if you're running Lustre/GPFS gateway nodes outside your dedicated storage appliance. For each category you clone or customize a software image: install the GPU driver and CUDA toolkit into the gpu-compute image, add InfiniBand/RoCE drivers (MLNX_OFED or in-box drivers) to whichever categories carry a fabric NIC, add the Slurm client packages, and enable your monitoring agent. You do this by chrooting into the image (BCM gives you a helper for this) and installing packages exactly as you would on a normal machine, then committing the image.</p>
+</div>
+
+<div class="card">
+<h3>Step 3 — PXE-boot and provision the compute nodes</h3>
+<p>With the network switches configured to allow PXE/DHCP traffic on the provisioning VLAN (see guide 02), power on the compute nodes with PXE boot as the first boot device (usually set once in BIOS/BMC, or via a boot-order override sent through IPMI/Redfish). Each node then follows this flow:</p>
+<ol>
+  <li>Node powers on, BMC/BIOS issues a PXE request on the provisioning NIC.</li>
+  <li>Head node's DHCP service on that network answers, handing out an IP and pointing at the TFTP boot loader.</li>
+  <li>Node downloads and boots a minimal Linux environment — the <strong>node-installer</strong> — over TFTP/HTTP.</li>
+  <li>The node-installer identifies the node (usually by MAC address, matched against a node object already defined in cmsh, or auto-discovered on first boot) and determines which category and software image apply.</li>
+  <li>It partitions local disk if needed, then pulls the full software image down from the head node over HTTPS/rsync and writes it to disk (or sets up diskless/NFS-root operation if the category is configured that way).</li>
+  <li>It writes node-specific configuration (hostname, network config, fstab entries) into the freshly installed filesystem.</li>
+  <li>The node reboots into the real installed OS, the local CMDaemon starts, registers with the head node, and the node transitions to an "UP" state visible in cmsh/Base View.</li>
+</ol>
+<p>You can watch this whole sequence live via <code>tail -f /var/log/node-installer</code> on the node's console (accessible through the BMC), or from the head node with <code>pexec</code>/cmsh's device open/power commands. New hardware you haven't seen before shows up in cmsh as an unassigned "discovered" node — you assign it a hostname/category, commit, and reboot it to trigger provisioning.</p>
+</div>
+
+<div class="card">
+<h3>Step 4 — Configure Slurm workload manager integration</h3>
+<p>BCM includes a Slurm "role" you assign to nodes and categories rather than hand-editing <code>slurm.conf</code> across the fleet. You designate one node (often the head node, or a dedicated node for larger clusters) with the <strong>slurmserver</strong> role, and assign the <strong>slurmclient</strong> role to every compute category. BCM then generates and distributes <code>slurm.conf</code>, <code>gres.conf</code> (for GPU resources), and cgroup configuration automatically, keeping them consistent across every node — including partition definitions, GPU GRES entries, and topology-aware settings for the fabric. Because BCM already knows each node's category, CPU count, and GPU inventory, it can populate most of the Slurm node definitions for you rather than you typing them by hand.</p>
+</div>
+
+<div class="card">
+<h3>Step 5 — Configure networking (InfiniBand/RoCE) via BCM</h3>
+<p>For the high-speed fabric configured in guide 02, BCM manages the relevant kernel modules, OFED stack, and interface configuration as part of the category's software image and network settings. You define the IB/RoCE network as a BCM network object (subnet, MTU, associated interfaces), attach node interfaces to it per category, and BCM ensures the right driver stack (e.g. MLNX_OFED or the in-box driver set) is present in the image and that interface naming/IP assignment stays consistent across every node of that category — avoiding the classic problem of one node's <code>ib0</code> silently becoming <code>ib1</code> after a driver update.</p>
+</div>
+
+<div class="card">
+<h3>Step 6 — Add monitoring</h3>
+<p>CMDaemon on every node already collects a baseline of metrics (CPU, memory, disk, network, and — with the GPU health/metrics package installed in the image — DCGM-based GPU metrics) and reports them back to the head node's monitoring database. From here you define health checks (disk full, GPU Xid errors, IB link down, temperature thresholds) and actions (email alert, Slack webhook, automatically drain the node from Slurm) directly in cmsh or Base View. Larger sites typically also export these metrics to Prometheus/Grafana for long-term dashboards — this guide covers that integration in a later monitoring-focused section.</p>
+</div>
+
+<h2>User management and LDAP</h2>
+<p>Out of the box, BCM maintains its own local user/group database, replicated by CMDaemon to every node so a user account created once works cluster-wide without manual <code>/etc/passwd</code> syncing. For real deployments you almost always want centralized identity instead — BCM can be pointed at an external LDAP or Active Directory server so user and group lookups are authoritative there rather than in BCM's local store. We cover the full LDAP setup, including how it interacts with Slurm accounting and home-directory automount, in a later section of this guide (see "LDAP and Centralized Identity").</p>
+
+<h2>BCM vs. xCAT vs. Warewulf — a quick preview</h2>
+<p>BCM is one of three provisioning approaches this guide covers; the next two sections walk through xCAT and Warewulf in full. The short version, for context while you read this section:</p>
+<table>
+<tr><th>Aspect</th><th>BCM</th><th>xCAT / Warewulf</th></tr>
+<tr><td>Licensing</td><td>Commercial (NVIDIA), often bundled with DGX/SuperPOD purchases</td><td>Open source, free</td></tr>
+<tr><td>Scope</td><td>Provisioning + monitoring + Slurm config + identity in one product</td><td>Provisioning-focused; you assemble monitoring/config-mgmt separately (e.g. with Ansible)</td></tr>
+<tr><td>Interface</td><td>cmsh CLI + Base View GUI + REST/Python API</td><td>CLI tools (xCAT: <code>xCAT</code> commands; Warewulf: <code>wwctl</code>), no bundled GUI</td></tr>
+<tr><td>Support model</td><td>NVIDIA enterprise support, tightly aligned with DGX reference architectures</td><td>Community support, HPC-center-driven development</td></tr>
+</table>
+<p>Deep, hands-on comparisons and migration notes come later in the guide — the point here is just that BCM trades a license fee for an integrated, vendor-supported experience that's especially common on NVIDIA DGX SuperPOD-style builds.</p>
+
+<h2>Diagram: BCM architecture</h2>
+<svg class="diagram" viewBox="0 0 900 400" xmlns="http://www.w3.org/2000/svg">
+  <style>
+    .lbl{font-family:sans-serif;font-size:13px;fill:#e8edf4}
+    .lbl2{font-family:sans-serif;font-size:11px;fill:#9fb0c3}
+    .box{fill:#1a2437;stroke:#25324a;stroke-width:1.5}
+    .accent{fill:#141c2b;stroke:#76b900;stroke-width:2}
+    .line{stroke:#4fc3f7;stroke-width:1.5;fill:none}
+    .line2{stroke:#76b900;stroke-width:1.5;fill:none}
+  </style>
+  <rect x="20" y="20" width="860" height="360" fill="#0d1420" stroke="#25324a"/>
+  <rect x="330" y="30" width="240" height="110" rx="8" class="accent"/>
+  <text x="450" y="52" text-anchor="middle" class="lbl" font-weight="bold">Head Node</text>
+  <text x="450" y="72" text-anchor="middle" class="lbl2">CMDaemon (master)</text>
+  <text x="450" y="88" text-anchor="middle" class="lbl2">DHCP / TFTP / PXE service</text>
+  <text x="450" y="104" text-anchor="middle" class="lbl2">Software image store</text>
+  <text x="450" y="120" text-anchor="middle" class="lbl2">cmsh / Base View / REST API</text>
+
+  <rect x="60" y="180" width="200" height="50" rx="6" class="box"/>
+  <text x="160" y="200" text-anchor="middle" class="lbl">Node Image: gpu-compute</text>
+  <text x="160" y="218" text-anchor="middle" class="lbl2">driver + CUDA + Slurm client</text>
+
+  <rect x="350" y="180" width="200" height="50" rx="6" class="box"/>
+  <text x="450" y="200" text-anchor="middle" class="lbl">Node Image: login</text>
+  <text x="450" y="218" text-anchor="middle" class="lbl2">dev tools + Slurm submit</text>
+
+  <rect x="640" y="180" width="200" height="50" rx="6" class="box"/>
+  <text x="740" y="200" text-anchor="middle" class="lbl">Node Image: cpu-compute</text>
+  <text x="740" y="218" text-anchor="middle" class="lbl2">base OS + Slurm client</text>
+
+  <line x1="450" y1="140" x2="160" y2="180" class="line2"/>
+  <line x1="450" y1="140" x2="450" y2="180" class="line2"/>
+  <line x1="450" y1="140" x2="740" y2="180" class="line2"/>
+
+  <rect x="20" y="270" width="860" height="18" fill="#111826" stroke="#25324a"/>
+  <text x="450" y="283" text-anchor="middle" class="lbl2">Provisioning / management network (PXE, DHCP, TFTP)</text>
+
+  <rect x="60" y="320" width="120" height="50" rx="6" class="box"/>
+  <text x="120" y="340" text-anchor="middle" class="lbl2">GPU node 001</text>
+  <text x="120" y="356" text-anchor="middle" class="lbl2">cmdaemon (client)</text>
+
+  <rect x="200" y="320" width="120" height="50" rx="6" class="box"/>
+  <text x="260" y="340" text-anchor="middle" class="lbl2">GPU node 002</text>
+  <text x="260" y="356" text-anchor="middle" class="lbl2">cmdaemon (client)</text>
+
+  <rect x="390" y="320" width="120" height="50" rx="6" class="box"/>
+  <text x="450" y="340" text-anchor="middle" class="lbl2">Login node</text>
+  <text x="450" y="356" text-anchor="middle" class="lbl2">cmdaemon (client)</text>
+
+  <rect x="580" y="320" width="120" height="50" rx="6" class="box"/>
+  <text x="640" y="340" text-anchor="middle" class="lbl2">CPU node 001</text>
+  <text x="640" y="356" text-anchor="middle" class="lbl2">cmdaemon (client)</text>
+
+  <rect x="720" y="320" width="120" height="50" rx="6" class="box"/>
+  <text x="780" y="340" text-anchor="middle" class="lbl2">CPU node 002</text>
+  <text x="780" y="356" text-anchor="middle" class="lbl2">cmdaemon (client)</text>
+
+  <line x1="120" y1="288" x2="120" y2="320" class="line"/>
+  <line x1="260" y1="288" x2="260" y2="320" class="line"/>
+  <line x1="450" y1="288" x2="450" y2="320" class="line"/>
+  <line x1="640" y1="288" x2="640" y2="320" class="line"/>
+  <line x1="780" y1="288" x2="780" y2="320" class="line"/>
+</svg>
+
+<h2>Diagram: provisioning workflow sequence</h2>
+<svg class="diagram" viewBox="0 0 900 400" xmlns="http://www.w3.org/2000/svg">
+  <style>
+    .slbl{font-family:sans-serif;font-size:13px;fill:#e8edf4}
+    .slbl2{font-family:sans-serif;font-size:11px;fill:#9fb0c3}
+    .sbox{fill:#1a2437;stroke:#25324a;stroke-width:1.5}
+    .sarrow{stroke:#76b900;stroke-width:2;fill:none;marker-end:url(#arrow)}
+  </style>
+  <defs>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#76b900"/>
+    </marker>
+  </defs>
+  <rect x="20" y="20" width="860" height="360" fill="#0d1420" stroke="#25324a"/>
+
+  <rect x="40" y="40" width="130" height="45" rx="6" class="sbox"/>
+  <text x="105" y="67" text-anchor="middle" class="slbl2">1. Power on / BMC PXE request</text>
+
+  <rect x="220" y="40" width="130" height="45" rx="6" class="sbox"/>
+  <text x="285" y="60" text-anchor="middle" class="slbl2">2. DHCP + TFTP</text>
+  <text x="285" y="74" text-anchor="middle" class="slbl2">from head node</text>
+
+  <rect x="400" y="40" width="130" height="45" rx="6" class="sbox"/>
+  <text x="465" y="60" text-anchor="middle" class="slbl2">3. Boot node-</text>
+  <text x="465" y="74" text-anchor="middle" class="slbl2">installer image</text>
+
+  <rect x="580" y="40" width="130" height="45" rx="6" class="sbox"/>
+  <text x="645" y="60" text-anchor="middle" class="slbl2">4. Identify node,</text>
+  <text x="645" y="74" text-anchor="middle" class="slbl2">match category</text>
+
+  <rect x="760" y="40" width="100" height="45" rx="6" class="sbox"/>
+  <text x="810" y="60" text-anchor="middle" class="slbl2">5. Partition</text>
+  <text x="810" y="74" text-anchor="middle" class="slbl2">local disk</text>
+
+  <line x1="170" y1="62" x2="215" y2="62" class="sarrow"/>
+  <line x1="350" y1="62" x2="395" y2="62" class="sarrow"/>
+  <line x1="530" y1="62" x2="575" y2="62" class="sarrow"/>
+  <line x1="710" y1="62" x2="755" y2="62" class="sarrow"/>
+
+  <path d="M810,85 C810,140 645,140 645,150" class="sarrow"/>
+
+  <rect x="580" y="150" width="130" height="45" rx="6" class="sbox"/>
+  <text x="645" y="170" text-anchor="middle" class="slbl2">6. Pull software</text>
+  <text x="645" y="184" text-anchor="middle" class="slbl2">image over HTTPS</text>
+
+  <line x1="580" y1="172" x2="530" y2="172" class="sarrow"/>
+
+  <rect x="400" y="150" width="130" height="45" rx="6" class="sbox"/>
+  <text x="465" y="170" text-anchor="middle" class="slbl2">7. Write node-</text>
+  <text x="465" y="184" text-anchor="middle" class="slbl2">specific config</text>
+
+  <line x1="400" y1="172" x2="350" y2="172" class="sarrow"/>
+
+  <rect x="220" y="150" width="130" height="45" rx="6" class="sbox"/>
+  <text x="285" y="170" text-anchor="middle" class="slbl2">8. Reboot into</text>
+  <text x="285" y="184" text-anchor="middle" class="slbl2">installed OS</text>
+
+  <line x1="220" y1="172" x2="170" y2="172" class="sarrow"/>
+
+  <rect x="40" y="150" width="130" height="45" rx="6" class="sbox"/>
+  <text x="105" y="170" text-anchor="middle" class="slbl2">9. cmdaemon</text>
+  <text x="105" y="184" text-anchor="middle" class="slbl2">client starts</text>
+
+  <path d="M105,195 C105,230 450,230 450,250" class="sarrow"/>
+
+  <rect x="330" y="250" width="240" height="55" rx="8" fill="#141c2b" stroke="#76b900" stroke-width="2"/>
+  <text x="450" y="275" text-anchor="middle" class="slbl" font-weight="bold">10. Node registers with head node</text>
+  <text x="450" y="293" text-anchor="middle" class="slbl2">state: UP — ready for Slurm jobs</text>
+
+  <text x="450" y="340" text-anchor="middle" class="slbl2">Typical time from power-on to UP for a re-image: a few minutes,</text>
+  <text x="450" y="358" text-anchor="middle" class="slbl2">dominated by the software-image transfer over the provisioning network.</text>
+</svg>
+
+<h2>Realistic cmsh example</h2>
+<p>The example below shows a plausible session: checking discovered hardware, creating a GPU compute category cloned from a base image, assigning nodes into it, adding the Slurm client role, and committing the changes. Command syntax follows standard BCM/Bright Cluster Manager <code>cmsh</code> conventions from the official admin manual.</p>
+<pre><code># Connect to the head node's management shell
+[root@head1 ~]# cmsh
+[head1]%
+
+# List nodes currently known to the cluster, including newly discovered hardware
+[head1]% device list
+Type            Hostname     MAC                Category    Network        IP
+------------ ------------ ------------------ ----------- -------------- --------------
+HeadNode        head1        00:1a:2b:aa:bb:cc  -           externalnet    10.0.0.1
+PhysicalNode    node001      00:1a:2b:11:22:01  gpu-compute internalnet    10.141.0.1
+PhysicalNode    node002      00:1a:2b:11:22:02  gpu-compute internalnet    10.141.0.2
+
+# Inspect available software images
+[head1]% softwareimage
+[head1->softwareimage]% list
+Name (key)              Path                                 Kernel version
+------------------------ ------------------------------------ ------------------
+default-image            /cm/images/default-image            5.14.0-x86_64
+gpu-compute-image        /cm/images/gpu-compute-image         5.14.0-x86_64
+
+# Create a category for GPU compute nodes and point it at the GPU image
+[head1->softwareimage]% category
+[head1->category]% add gpu-compute
+[head1->category*[gpu-compute*]]% set softwareimage gpu-compute-image
+[head1->category*[gpu-compute*]]% commit
+
+# Add the Slurm client role so every node in this category joins the cluster
+[head1->category]% use gpu-compute
+[head1->category[gpu-compute]]% roles
+[head1->category[gpu-compute]->roles]% assign slurmclient
+[head1->category[gpu-compute]->roles*[slurmclient*]]% set queue gpu
+[head1->category[gpu-compute]->roles*[slurmclient*]]% commit
+
+# Assign a discovered node into the category and give it a hostname
+[head1->category]% device use node003
+[head1->device[node003]]% set category gpu-compute
+[head1->device[node003]]% set hostname gpu003
+[head1->device*[gpu003*]]% commit
+
+# Power-cycle the node to kick off PXE provisioning
+[head1->device]% power reset gpu003
+Successfully sent 'reset' to: gpu003
+
+# Watch the node come up
+[head1->device]% status gpu003
+gpu003 ......................... [ INSTALLING ]
+[head1->device]% status gpu003
+gpu003 ......................... [ UP ]
+</code></pre>
+
+<div class="callout warn">
+<div class="label">Field note</div>
+Software image changes don't take effect on running nodes until you either reboot the node or push an update with <code>imageupdate</code>/<code>updateprovisioners</code>-style sync commands — editing a category's image doesn't retroactively touch nodes that are already up and running.
+</div>
+
+<h2>Further Reading</h2>
+<ul>
+  <li><a href="https://docs.nvidia.com/base-command-manager/manuals/11/admin-manual.pdf" target="_blank" rel="noopener">NVIDIA Base Command Manager 11 — Administrator Manual (PDF)</a></li>
+  <li><a href="https://docs.nvidia.com/base-command-manager/manuals/11/installation-manual.pdf" target="_blank" rel="noopener">NVIDIA Base Command Manager 11 — Installation Manual (PDF)</a></li>
+  <li><a href="https://docs.nvidia.com/mission-control/docs/systems-administration-guide/2.3.0/node-category-management.html" target="_blank" rel="noopener">NVIDIA Mission Control Software — Node and Category Management</a></li>
+  <li><a href="https://docs.nvidia.com/mission-control/docs/rack-bring-up-install/2.0.0/bcm-installation.html" target="_blank" rel="noopener">NVIDIA Mission Control — BCM Software Installation Guide</a></li>
+  <li><a href="https://docs.nvidia.com/dgx-basepod/deployment-guides/dgx-basepod-a100/latest/deployment-configure.html" target="_blank" rel="noopener">NVIDIA DGX BasePOD Deployment Guide — Cluster Configuration</a></li>
+  <li><a href="https://www.nvidia.com/en-us/data-center/base-command/manager/" target="_blank" rel="noopener">NVIDIA Base Command Manager — Product Page</a></li>
+</ul>
+
+<div class="section-nav"><a href="03-storage.html">← Storage</a><a href="05-provisioning-xcat.html">Next: Provisioning with xCAT →</a></div>
+</main>
+</div>
+<footer><div class="wrap">Part of the HPC Cluster Build Guide.</div></footer>
+</body>
+</html>

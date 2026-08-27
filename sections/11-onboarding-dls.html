@@ -1,0 +1,312 @@
+<!DOCTYPE html>
+<html data-theme="dark" lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>User Onboarding & Distribution Lists (DLs) — HPC Cluster Build Guide</title>
+<link rel="stylesheet" href="../assets/css/style.css">
+</head>
+<body>
+<header class="top"><div class="wrap"><a href="../index.html">HPC Cluster Build Guide</a><span class="badge">Public Edition</span></div></header>
+<div class="wrap">
+<nav class="crumbs"><a href="10-identity-sssd.html">← SSSD Integration</a></nav>
+<main>
+
+<h1>11 — User Onboarding & Distribution Lists (DLs)</h1>
+<p class="lede">A cluster with perfect hardware and a flawless scheduler is still useless to a new hire who can't log in. Onboarding is the unglamorous plumbing that turns "I was told I have access" into an actual working shell prompt — and getting it wrong is one of the most common sources of week-one frustration on any HPC system.</p>
+
+<h2>Why cluster onboarding is harder than a normal web app</h2>
+<p>Signing up for a SaaS tool usually means: create an account, verify an email, done. Granting someone working access to an HPC cluster is a small stack of distinct systems that all have to agree with each other before a single <code>srun</code> command will succeed:</p>
+<div class="card">
+<ul>
+<li><strong>A Unix identity</strong> — a UID and GID that is consistent across every login node, compute node, and storage server, normally sourced from LDAP or Active Directory rather than created locally on each machine (see <a href="10-identity-sssd.html">Section 10</a>).</li>
+<li><strong>Authentication material</strong> — an SSH public key registered against that identity, or a Kerberos principal, so the user can actually prove who they are.</li>
+<li><strong>A project / allocation assignment</strong> — which grant, budget code, or research group's compute time the user's jobs should be billed against.</li>
+<li><strong>Storage quota</strong> — a home directory, and usually a project/scratch directory, with quota limits set correctly on day one instead of "unlimited until someone notices."</li>
+<li><strong>A Slurm association</strong> — the tuple of (cluster, account, user, partition) that the scheduler checks before it will even queue a job, plus a QOS that determines priority and resource caps.</li>
+<li><strong>Group membership for access control</strong> — Unix/LDAP groups that gate which partitions, licensed software, or fairshare accounts the user is allowed to touch.</li>
+</ul>
+</div>
+<p>Miss any one of these and the failure mode is usually a cryptic error days later — "Invalid account or account/partition combination" from Slurm, or a home directory owned by the wrong UID after a re-image — rather than a clean "access denied" at the front door. That's why HPC teams try hard to make onboarding a single, repeatable pipeline instead of a checklist a human re-types from memory each time.</p>
+
+<h2>Distribution Lists (DLs) as the access-control lever</h2>
+<p>A Distribution List (or mail-enabled security group, or Entra ID/AD security group — the corporate-IT terms overlap heavily) is the object your organization already uses for things like "everyone on the AI Research team gets this email" or "everyone in this group can book this shared calendar." HPC teams reuse the same object as the <strong>single source of truth for cluster access tiers</strong>.</p>
+<p>The pattern: create (or reuse) a group like <code>team-ai-research</code> in the corporate directory, and treat membership in that group as the trigger for "this person should have cluster access at tier X." A PI or team lead manages membership through the normal corporate group-management UI — no cluster admin ticket required for routine adds. A scheduled sync job then mirrors that membership into the cluster's own LDAP/POSIX group, and everything downstream (home directory creation, Slurm association, partition access) keys off that POSIX group.</p>
+<div class="callout tip">
+<div class="label">Why this matters</div>
+Without a DL-to-cluster-group mapping, every new hire becomes a manual cluster-admin ticket: create Unix account, add to Slurm, set quota, done — repeated by hand, every time, for every cluster. With the mapping in place, the cluster admin's job shrinks to "make sure the sync job ran," and access changes flow at the speed of a corporate group edit. This is also why offboarding tends to actually happen on time when it's DL-driven — removing someone from a DL is a five-second action a manager already knows how to do, versus filing a ticket that might sit for weeks.
+</div>
+
+<h2>End-to-end onboarding pipeline</h2>
+<p>The diagram below shows the full path from "a new team member needs cluster access" to "they've run their first job." Each stage is intentionally decoupled so that a failure or delay in one stage (say, a slow approval) doesn't corrupt the state of the others.</p>
+
+<svg class="diagram" viewBox="0 0 900 400" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <marker id="arrow11a" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#76b900"/>
+    </marker>
+  </defs>
+  <style>
+    .box{fill:#1a2437;stroke:#25324a;stroke-width:1.5;rx:8;}
+    .lbl{fill:#e8edf4;font-family:sans-serif;font-size:13px;font-weight:600;text-anchor:middle;}
+    .sub{fill:#9fb0c3;font-family:sans-serif;font-size:10.5px;text-anchor:middle;}
+    .flow{stroke:#76b900;stroke-width:2;fill:none;marker-end:url(#arrow11a);}
+  </style>
+  <rect x="10" y="40" width="130" height="60" class="box"/>
+  <text x="75" y="65" class="lbl">1. Request</text>
+  <text x="75" y="82" class="sub">ticket / access form</text>
+
+  <rect x="170" y="40" width="130" height="60" class="box"/>
+  <text x="235" y="65" class="lbl">2. Approval</text>
+  <text x="235" y="82" class="sub">PI / manager sign-off</text>
+
+  <rect x="330" y="40" width="150" height="60" class="box"/>
+  <text x="405" y="65" class="lbl">3. Added to DL</text>
+  <text x="405" y="82" class="sub">team-ai-research group</text>
+
+  <rect x="510" y="40" width="150" height="60" class="box"/>
+  <text x="585" y="65" class="lbl">4. Sync job runs</text>
+  <text x="585" y="82" class="sub">LDAP/AD sync or SCIM</text>
+
+  <rect x="690" y="40" width="190" height="60" class="box"/>
+  <text x="785" y="65" class="lbl">5. Provisioning</text>
+  <text x="785" y="82" class="sub">POSIX group + home + quota</text>
+
+  <rect x="690" y="160" width="190" height="60" class="box"/>
+  <text x="785" y="185" class="lbl">6. Slurm association</text>
+  <text x="785" y="202" class="sub">sacctmgr add user</text>
+
+  <rect x="510" y="160" width="150" height="60" class="box"/>
+  <text x="585" y="185" class="lbl">7. Welcome email</text>
+  <text x="585" y="202" class="sub">getting-started docs</text>
+
+  <rect x="330" y="160" width="150" height="60" class="box"/>
+  <text x="405" y="185" class="lbl">8. First login</text>
+  <text x="405" y="202" class="sub">validation checklist</text>
+
+  <path class="flow" d="M140,70 H170"/>
+  <path class="flow" d="M300,70 H330"/>
+  <path class="flow" d="M480,70 H510"/>
+  <path class="flow" d="M660,70 H690"/>
+  <path class="flow" d="M785,100 V160"/>
+  <path class="flow" d="M690,190 H660"/>
+  <path class="flow" d="M510,190 H480"/>
+
+  <rect x="80" y="260" width="740" height="110" fill="none" stroke="#25324a" stroke-width="1" rx="8"/>
+  <text x="450" y="285" class="sub" font-size="12" font-weight="600" fill="#4fc3f7">Key principle</text>
+  <text x="450" y="310" class="sub">Steps 1–2 are human/process (ticket + approval). Steps 3–7 are automated once</text>
+  <text x="450" y="328" class="sub">the DL membership changes — no per-user cluster admin ticket needed. Step 8 is</text>
+  <text x="450" y="346" class="sub">the only step that requires the *user* to do something (SSH key, first srun).</text>
+</svg>
+
+<div class="card">
+<h3>Walking through each stage</h3>
+<p><strong>1. Request</strong> — the user (or their manager) files a ticket or fills out an access-request form naming the project/allocation they need access to.</p>
+<p><strong>2. Approval</strong> — the PI, team lead, or allocation owner approves. This is the only gate that should require human judgment; everything after it should be mechanical.</p>
+<p><strong>3. Added to DL/AD group</strong> — once approved, the requester (or an automated workflow acting on the approval) adds the user to the corporate DL/security group that maps to the target cluster access tier, e.g. <code>team-ai-research</code> → <code>hpc-ai-research-users</code>.</p>
+<p><strong>4. Sync job</strong> — a scheduled job (cron, systemd timer, or an identity-governance connector) reads DL membership from Active Directory/Entra ID and reconciles it against the cluster's LDAP directory or local <code>/etc/group</code> state. This can be a vendor tool (Entra Cloud Sync group provisioning, SSSD's AD provider with dynamic group mapping) or a small custom script — see the code examples below.</p>
+<p><strong>5. Provisioning</strong> — the sync (or a hook it triggers) creates the POSIX group if it doesn't exist, creates the user's home directory with correct ownership and mode, and sets an initial storage quota.</p>
+<p><strong>6. Slurm association</strong> — <code>sacctmgr</code> creates the (cluster, account, user) association and assigns a default QOS, so the scheduler will accept jobs from this user under the right billing account.</p>
+<p><strong>7. Welcome email</strong> — an automated email (ideally templated, not hand-typed) with links to getting-started docs, the SSH onboarding steps, and who to contact for help.</p>
+<p><strong>8. First login validation</strong> — the user completes the Day-1 checklist below; a lightweight validation script can confirm home directory ownership, quota, and Slurm association are all correctly in place before declaring onboarding "done."</p>
+</div>
+
+<h2>Automating provisioning: sacctmgr, home directories, and group sync</h2>
+<p>None of the steps above need to be manual toil. Below are the building blocks a cluster team typically scripts around.</p>
+
+<h3>Slurm accounting: creating the user association</h3>
+<p>Slurm tracks accounting and enforces access at the level of an <em>association</em> — the (cluster, account, user, partition) tuple, managed entirely through <code>sacctmgr</code> against the slurmdbd database. Per the SchedMD accounting docs, you must define clusters before accounts, and accounts before users — the hierarchy has to exist top-down.</p>
+<pre><code># 1. Create the billing/allocation account (once, per project)
+sacctmgr add account ai_research \
+    Description="AI Research team allocation" \
+    Organization="team-ai-research"
+
+# 2. Add the new user to that account on this cluster,
+#    with a default QOS and a fairshare weight
+sacctmgr add user name=jsmith \
+    account=ai_research \
+    cluster=oci-nrt-cs-001 \
+    partition=gpu-a100 \
+    qos=normal \
+    fairshare=100
+
+# 3. Verify the association landed correctly
+sacctmgr show assoc user=jsmith format=Account,Cluster,User,Partition,QOS
+
+# 4. (Offboarding mirror, see below) — revoke without deleting history
+sacctmgr modify user jsmith set MaxSubmitJobs=0
+</code></pre>
+<p>Note the last line: for offboarding, most sites prefer to <em>set limits to zero</em> rather than immediately deleting the association — deleting an association can orphan historical accounting records for jobs the user already ran, which breaks usage reporting.</p>
+
+<h3>Home directory creation with correct ownership and quota</h3>
+<p>This is typically a small idempotent script run by the provisioning step, either directly or as an LDAP/SSSD post-sync hook:</p>
+<pre><code>#!/usr/bin/env bash
+# provision_home.sh <username> <uid> <gid> <quota_gb>
+set -euo pipefail
+USER="$1"; UID_N="$2"; GID_N="$3"; QUOTA_GB="$4"
+HOME_DIR="/home/${USER}"
+
+if [ ! -d "$HOME_DIR" ]; then
+  mkdir -p "$HOME_DIR"
+  cp -r /etc/skel/. "$HOME_DIR"
+fi
+
+chown -R "${UID_N}:${GID_N}" "$HOME_DIR"
+chmod 750 "$HOME_DIR"
+
+# Example: GPFS/NFS quota via a filer-side quota tool
+# (swap for your storage backend's actual CLI, e.g. `zfs set quota=`,
+#  `mmsetquota` for GPFS, or NetApp `qtree`/`quota` commands)
+set_fs_quota --path "$HOME_DIR" --hard "${QUOTA_GB}G" --soft "$((QUOTA_GB * 9 / 10))G"
+
+echo "Provisioned home for ${USER} (uid=${UID_N}) quota=${QUOTA_GB}G"
+</code></pre>
+
+<h3>Syncing a DL/AD group into a POSIX group</h3>
+<p>There are three common approaches, in increasing order of "buy vs. build":</p>
+<table>
+<tr><th>Approach</th><th>How it works</th><th>Best for</th></tr>
+<tr><td>SSSD AD provider auto-mapping</td><td>SSSD reads AD group membership directly at auth time via <code>ldap_group_*</code> / <code>ad_gpo_*</code> settings; no separate sync job needed since SSSD is already the identity provider (see <a href="10-identity-sssd.html">Section 10</a>)</td><td>Sites already using SSSD against AD as the primary identity source</td></tr>
+<tr><td>Managed identity-governance sync</td><td>Entra Cloud Sync / SCIM connector provisions group membership into an on-prem AD or LDAP target on a schedule</td><td>Larger orgs with existing Entra ID/Entra Governance investment</td></tr>
+<tr><td>Custom scheduled sync script</td><td>A cron job queries the DL via Graph API/LDAP, diffs against the cluster's POSIX group, and applies adds/removes</td><td>Small teams, or bridging a DL type the managed connectors don't support</td></tr>
+</table>
+<pre><code>#!/usr/bin/env python3
+# sync_dl_to_posix_group.py — run every 15 min via cron/systemd timer
+import subprocess
+from graph_client import get_group_members  # thin wrapper over MS Graph API
+
+DL_NAME = "team-ai-research"
+POSIX_GROUP = "hpc-ai-research-users"
+
+def current_posix_members(group):
+    out = subprocess.run(["getent", "group", group], capture_output=True, text=True)
+    return set(out.stdout.strip().split(":")[-1].split(","))
+
+def main():
+    desired = set(get_group_members(DL_NAME))       # usernames from the DL
+    current = current_posix_members(POSIX_GROUP)
+
+    to_add = desired - current
+    to_remove = current - desired
+
+    for user in to_add:
+        subprocess.run(["usermod", "-aG", POSIX_GROUP, user], check=True)
+        print(f"[sync] added {user} to {POSIX_GROUP}")
+
+    for user in to_remove:
+        subprocess.run(["gpasswd", "-d", user, POSIX_GROUP], check=True)
+        print(f"[sync] removed {user} from {POSIX_GROUP} (no longer in DL)")
+
+if __name__ == "__main__":
+    main()
+</code></pre>
+<div class="callout warn">
+<div class="label">Watch out</div>
+A naive sync script that only <em>adds</em> and never <em>removes</em> quietly turns your access model into a ratchet — people accumulate access and it never comes back off. Always diff both directions, and log every removal so an audit can explain "who lost access, and when."
+</div>
+
+<h2>Offboarding: the mirror process that's easy to neglect</h2>
+<p>Offboarding gets far less engineering attention than onboarding, mostly because nobody demos it in a sprint review — but a stale association is a real security and cost-control problem: idle allocations still count against fairshare history, and an ex-employee's still-valid SSH key is exactly the kind of gap an audit will flag.</p>
+
+<svg class="diagram" viewBox="0 0 900 400" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <marker id="arrow11b" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#ff6b6b"/>
+    </marker>
+  </defs>
+  <style>
+    .box2{fill:#1a2437;stroke:#ff6b6b;stroke-width:1.3;rx:8;}
+    .lbl2{fill:#e8edf4;font-family:sans-serif;font-size:13px;font-weight:600;text-anchor:middle;}
+    .sub2{fill:#9fb0c3;font-family:sans-serif;font-size:10.5px;text-anchor:middle;}
+    .flow2{stroke:#ff6b6b;stroke-width:2;fill:none;marker-end:url(#arrow11b);}
+  </style>
+  <rect x="20" y="150" width="150" height="60" class="box2"/>
+  <text x="95" y="175" class="lbl2">1. Removed from DL</text>
+  <text x="95" y="192" class="sub2">HR event or manager action</text>
+
+  <rect x="210" y="150" width="150" height="60" class="box2"/>
+  <text x="285" y="175" class="lbl2">2. Sync detects removal</text>
+  <text x="285" y="192" class="sub2">next scheduled run</text>
+
+  <rect x="400" y="150" width="150" height="60" class="box2"/>
+  <text x="475" y="175" class="lbl2">3. Disable account</text>
+  <text x="475" y="192" class="sub2">lock login, revoke SSH keys</text>
+
+  <rect x="590" y="150" width="150" height="60" class="box2"/>
+  <text x="665" y="175" class="lbl2">4. Revoke Slurm assoc.</text>
+  <text x="665" y="192" class="sub2">MaxSubmitJobs=0</text>
+
+  <rect x="590" y="260" width="150" height="60" class="box2"/>
+  <text x="665" y="285" class="lbl2">5. Quota-lock home</text>
+  <text x="665" y="302" class="sub2">read-only, then archive</text>
+
+  <rect x="400" y="260" width="150" height="60" class="box2"/>
+  <text x="475" y="285" class="lbl2">6. Retention window</text>
+  <text x="475" y="302" class="sub2">e.g. 90 days</text>
+
+  <rect x="210" y="260" width="150" height="60" class="box2"/>
+  <text x="285" y="285" class="lbl2">7. Purge / delete</text>
+  <text x="285" y="302" class="sub2">after PI sign-off</text>
+
+  <path class="flow2" d="M170,180 H210"/>
+  <path class="flow2" d="M360,180 H400"/>
+  <path class="flow2" d="M550,180 H590"/>
+  <path class="flow2" d="M665,210 V260"/>
+  <path class="flow2" d="M590,290 H550"/>
+  <path class="flow2" d="M400,290 H360"/>
+
+  <text x="450" y="60" class="sub2" font-size="12" fill="#ffb74d" font-weight="600">Same infrastructure as onboarding, run in reverse —</text>
+  <text x="450" y="80" class="sub2" font-size="12" fill="#ffb74d">the sync job and sacctmgr are the same tools, just removing instead of adding.</text>
+</svg>
+
+<div class="card">
+<h3>Offboarding step detail</h3>
+<ul>
+<li><strong>Remove from DL</strong> — ideally triggered automatically from an HR termination event, not a manual step someone has to remember.</li>
+<li><strong>Sync detects removal</strong> — the exact same scheduled sync job from onboarding picks up the membership diff and runs the "remove" branch.</li>
+<li><strong>Disable the account</strong> — lock the Unix account (<code>usermod -L</code> / disable in AD) and revoke or expire the SSH key so no new sessions can start, without deleting the account outright (in-flight jobs may still need to finish or be cleanly killed).</li>
+<li><strong>Revoke the Slurm association</strong> — set submit limits to zero (<code>sacctmgr modify user … set MaxSubmitJobs=0</code>) rather than deleting the association immediately, to preserve accounting history.</li>
+<li><strong>Quota-lock the home directory</strong> — flip to read-only and freeze the quota rather than deleting data instantly; give the PI/manager a window to retrieve anything needed.</li>
+<li><strong>Retention window</strong> — typically 30–90 days depending on site policy, after which the data is archived or purged.</li>
+<li><strong>Purge</strong> — final deletion, ideally requiring explicit PI/manager sign-off so nobody's unpublished results vanish by accident.</li>
+</ul>
+</div>
+
+<h2>Day-1 checklist</h2>
+<p>Hand this to every new user as part of the welcome email — it's the human-facing counterpart to the automated pipeline above.</p>
+<div class="card">
+<ul>
+<li>☐ Confirm you received the welcome email with your cluster hostname and account name</li>
+<li>☐ Generate an SSH key pair if you don't already have one (<code>ssh-keygen -t ed25519</code>) and submit the public key through the access portal</li>
+<li>☐ Log in to a login/head node and confirm your shell prompt shows the expected username and UID (<code>id</code>)</li>
+<li>☐ Check your home directory ownership and quota (<code>quota -s</code> or the site's storage-quota command)</li>
+<li>☐ Run <code>sacctmgr show assoc user=$USER</code> to confirm your account, partition, and QOS are correct</li>
+<li>☐ List available software with <code>module avail</code> and load a module (<code>module load</code>) to confirm the module system works</li>
+<li>☐ Submit a trivial first Slurm job (e.g. <code>sbatch --wrap="hostname" -A ai_research -p gpu-a100</code>) and confirm it completes with <code>sacct -j &lt;jobid&gt;</code></li>
+<li>☐ Bookmark the getting-started docs and the support/ticket channel for your site</li>
+<li>☐ If you expect to need more storage than the default quota, submit a quota-increase request through the same access-portal workflow used for the original request — don't wait until you hit the limit mid-job</li>
+</ul>
+</div>
+
+<div class="callout tip">
+<div class="label">Tip</div>
+Bake the first four checklist items into an automated post-provisioning validation script that runs right after step 6 of the onboarding pipeline. If any of them fail — wrong UID on the home directory, missing Slurm association — you find out from a monitoring alert before the new hire ever files a "I can't log in" ticket.
+</div>
+
+<h2>Further Reading</h2>
+<ul>
+<li><a href="https://slurm.schedmd.com/accounting.html" target="_blank" rel="noopener">Slurm Workload Manager — Accounting and Resource Limits</a></li>
+<li><a href="https://slurm.schedmd.com/sacctmgr.html" target="_blank" rel="noopener">Slurm Workload Manager — sacctmgr command reference</a></li>
+<li><a href="https://hpc-docs.uni.lu/slurm/accounts/" target="_blank" rel="noopener">ULHPC Technical Documentation — Slurm Account Hierarchy</a></li>
+<li><a href="https://docs.ycrc.yale.edu/clusters-at-yale/job-scheduling/slurm-account" target="_blank" rel="noopener">Yale Center for Research Computing — Slurm Accounts</a></li>
+<li><a href="https://learn.microsoft.com/en-us/entra/identity/users/directory-overview-user-model" target="_blank" rel="noopener">Microsoft Learn — Users, groups, licensing, and roles in Microsoft Entra ID</a></li>
+<li><a href="https://learn.microsoft.com/en-us/entra/identity/hybrid/cloud-sync/tutorial-group-provisioning" target="_blank" rel="noopener">Microsoft Learn — Provision groups to Active Directory via Microsoft Entra Cloud Sync</a></li>
+<li><a href="https://learn.microsoft.com/en-us/entra/id-governance/scenarios/provision-ldap" target="_blank" rel="noopener">Microsoft Learn — Govern provisioning to on-premises LDAP-based apps</a></li>
+</ul>
+
+<div class="section-nav"><a href="10-identity-sssd.html">← SSSD Integration</a><a href="12-monitoring.html">Next: Monitoring & Observability →</a></div>
+</main>
+</div>
+<footer><div class="wrap">Part of the HPC Cluster Build Guide.</div></footer>
+</body>
+</html>

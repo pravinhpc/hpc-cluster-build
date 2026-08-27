@@ -1,0 +1,141 @@
+<!DOCTYPE html>
+<html data-theme="dark" lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>19 — CSP Comparison: AWS vs. GCP vs. Azure vs. OCI for GPU Clusters | HPC Cluster Build Guide</title>
+<link rel="stylesheet" href="../assets/css/style.css">
+</head>
+<body>
+<header class="top"><div class="wrap"><a href="../index.html">HPC Cluster Build Guide</a><span class="badge">Public Edition</span></div></header>
+<div class="wrap"><nav class="crumbs"><a href="18-csp-oci.html">← CSP Build — OCI</a></nav>
+<main>
+
+<h1>19 — CSP Comparison: AWS vs. GCP vs. Azure vs. OCI for GPU Clusters</h1>
+<p class="lede">The previous four sections walked through building a GPU HPC/AI cluster on each hyperscaler individually. This page puts them side by side. The short version: all four offer credible paths to a multi-thousand-GPU cluster with a modern NVIDIA generation and a purpose-built cluster-networking fabric, but they differ meaningfully in which GPU generations ship first, what the interconnect is actually called and how it's implemented, which tool sits at the center of the build, and how storage and pricing are structured. None of the four is a wrong choice in the abstract — the right one depends on your workload shape, your existing cloud footprint, and how much you value a single opinionated toolchain versus low-level control.</p>
+
+<div class="callout tip">
+<div class="label">How to read this page</div>
+This is a comparison, not a ranking. Each CSP's own build-out section (linked below) covers the mechanics in depth — this page exists to help you decide which one to start with, or how to reason about running more than one.
+</div>
+
+<h2>Compute: GPU Generations and Representative Shapes</h2>
+<p>All four CSPs now offer Hopper (H100/H200) generally, and all four have Blackwell (B200/GB200/GB300) shipping or in fast rollout as of mid-2026. The differences are in exact instance/shape naming and in how the GPUs are packaged — individual 8-GPU nodes vs. rack-scale NVLink domains (GB200/GB300 NVL72, spanning up to 72 GPUs in one NVLink domain).</p>
+
+<table>
+<tr><th>CSP</th><th>Hopper-class</th><th>Blackwell-class</th><th>Packaging notes</th></tr>
+<tr><td>AWS</td><td>P5 (H100), P5en (H200)</td><td>P6-B200 (8× B200/node), P6e-GB200 / P6e-GB300 UltraServers (NVL72, up to 72 GPUs/NVLink domain)</td><td>UltraServers are the rack-scale NVLink72 SKU; UltraClusters are the petabit-scale multi-rack network fabric</td></tr>
+<tr><td>GCP</td><td>A3 High / A3 Mega (H100), A3 Ultra (H200)</td><td>A4 (B200, 8/node), A4X (GB200 NVL72)</td><td>A3 Mega/Ultra and A4/A4X differ mainly in NIC count and GPUDirect variant, not GPU count per VM</td></tr>
+<tr><td>Azure</td><td>ND H100 v5, ND H200 v5</td><td>ND GB200 v6 (NVL72, 36 Grace CPUs + 72 Blackwell GPUs), ND GB300 v6</td><td>ND-series VMs are 8-GPU boxes except the GB200/GB300 v6 rack-scale SKUs</td></tr>
+<tr><td>OCI</td><td>BM.GPU.H100.8, BM.GPU.H200.8 (bare metal, 8 GPU/host)</td><td>BM.GPU.GB200.4 and GB200/GB300 Superclusters</td><td>OCI defaults to bare metal rather than virtualized instances for GPU shapes</td></tr>
+</table>
+
+<h2>CPU Pairing</h2>
+<p>Host CPUs are overwhelmingly x86 (Intel Xeon or AMD EPYC, generation tied to the GPU platform generation) across all four clouds for GPU-attached nodes — the GPU is the bottleneck resource, so host CPU choice is mostly fixed by the reference design rather than customer-selectable. The one structural exception is the GB200/GB300 NVL72 rack-scale platform (offered by all four CSPs in some form), which pairs each Blackwell GPU pair with an NVIDIA Grace ARM CPU rather than x86 — this is a platform-level choice (Grace-Blackwell superchip), not a per-CSP option. Outside of GB200/GB300, ARM host options exist on all four clouds (Graviton on AWS, Axion on GCP, Cobalt on Azure, Ampere A1 on OCI) but are used for general-purpose/CPU-only fleets, not paired with H100/H200/B200 GPU nodes.</p>
+
+<h2>Network Fabric</h2>
+<p>This is where the four platforms diverge the most, both in underlying technology and in naming.</p>
+<table>
+<tr><th>CSP</th><th>Fabric name</th><th>Underlying tech</th><th>Notes</th></tr>
+<tr><td>AWS</td><td>EFA (Elastic Fabric Adapter), EFAv4 on P6 generation</td><td>Custom RDMA-capable NIC over AWS's Nitro network, SRD (Scalable Reliable Datagram) transport</td><td>Up to 28.8 Tb/s aggregate per GB200 UltraServer; deployed at UltraCluster scale as non-blocking petabit-class fabric</td></tr>
+<tr><td>GCP</td><td>GPUDirect-TCPX / TCPXO (A3-class), GPUDirect-RDMA (A3 Ultra, A4, A4X)</td><td>TCPX/TCPXO are GCP's offloaded-TCP RDMA-like stacks; newer H200/B200/GB200 tiers move to true GPUDirect RDMA</td><td>The TCPX→TCPXO→RDMA progression reflects GCP's networking stack maturing generation over generation — worth confirming which variant a given machine type uses</td></tr>
+<tr><td>Azure</td><td>InfiniBand NDR (Quantum-2)</td><td>NVIDIA Quantum-2 InfiniBand, 400 Gb/s per GPU, non-blocking fat-tree</td><td>Closest to an on-prem InfiniBand SuperPOD topology of the four — dedicated per-GPU IB NIC, not a shared/virtualized fabric</td></tr>
+<tr><td>OCI</td><td>OCI Cluster Network (RoCE v2)</td><td>Custom RoCE v2 implementation, 2.5-9.1μs latency</td><td>Up to 3,200 Gb/s cluster network bandwidth per host; OCI has also historically offered InfiniBand-based cluster networking for some shapes</td></tr>
+</table>
+
+<h2>Primary Cluster-Build Tooling</h2>
+<table>
+<tr><th>CSP</th><th>Primary tool</th><th>Model</th></tr>
+<tr><td>AWS</td><td>AWS ParallelCluster</td><td>Open-source, CLI/config-driven; wraps CloudFormation to stand up head node, Slurm, fabric, and storage together; now supports P6e-GB200/P6-B200</td></tr>
+<tr><td>GCP</td><td>Cluster Toolkit (formerly Cluster Toolkit for Slurm / "cloud-hpc-toolkit")</td><td>Terraform-based blueprints; composes VPC, GPUDirect config, filesystem, and Slurm/GKE into a single deployable spec</td></tr>
+<tr><td>Azure</td><td>CycleCloud (plus CycleCloud Workspace for Slurm)</td><td>GUI + API-driven cluster lifecycle manager; provisions Slurm/PBS/Grid Engine clusters with autoscaling on top of ND-series VMs</td></tr>
+<tr><td>OCI</td><td>OCI HPC / Cluster Networking stack via Terraform (OCI Resource Manager + community Terraform modules)</td><td>More do-it-yourself than the other three: Terraform stands up bare metal instances, RDMA cluster network, and block/file storage; Slurm bring-up is typically layered on separately</td></tr>
+</table>
+<p>All four tools ultimately do the same job — turn a declarative spec into a running Slurm (or Kubernetes) cluster with fabric and storage wired up — but they sit at different points on the "opinionated product" to "composable infrastructure-as-code" spectrum. ParallelCluster and CycleCloud lean toward turnkey; Cluster Toolkit and OCI's Terraform-first approach lean toward composable.</p>
+
+<h2>Storage</h2>
+<table>
+<tr><th>CSP</th><th>High-performance parallel FS</th><th>General-purpose managed storage</th></tr>
+<tr><td>AWS</td><td>Amazon FSx for Lustre</td><td>S3 (object), EBS (block), FSx for OpenZFS</td></tr>
+<tr><td>GCP</td><td>Parallelstore (Lustre-based, DAOS-derived)</td><td>Cloud Storage (object), Filestore (NFS), Persistent Disk (block)</td></tr>
+<tr><td>Azure</td><td>Azure Managed Lustre</td><td>Azure NetApp Files (NFS/SMB), Blob Storage (object), Managed Disks (block)</td></tr>
+<tr><td>OCI</td><td>OCI File Storage (NFS) at scale, plus third-party parallel FS (Lustre, WEKA) deployable on bare metal</td><td>Object Storage, Block Volumes</td></tr>
+</table>
+<p>All four support mounting a parallel filesystem across the compute fleet for checkpoint and dataset I/O; the practical difference is how "native" the offering is. FSx for Lustre and Parallelstore are the most turnkey, purpose-built managed parallel filesystems; Azure Managed Lustre is newer to general availability; OCI leans more on customer-deployed parallel filesystems atop its high-throughput File Storage and block storage primitives.</p>
+
+<h2>Pricing Model</h2>
+<p>The commercial models look superficially similar (on-demand, reserved/committed-use, spot/preemptible) but the discount depth and capacity guarantees differ:</p>
+<table>
+<tr><th>CSP</th><th>On-demand</th><th>Committed/reserved</th><th>Spot equivalent</th></tr>
+<tr><td>AWS</td><td>Standard hourly</td><td>Savings Plans, Reserved Instances, Capacity Blocks for ML (short-term capacity reservation for GPU instances)</td><td>EC2 Spot — steep discount, can be reclaimed</td></tr>
+<tr><td>GCP</td><td>Standard hourly</td><td>Committed Use Discounts (CUDs), Dynamic Workload Scheduler / Flex-start &amp; Calendar mode for GPU capacity</td><td>Spot VMs</td></tr>
+<tr><td>Azure</td><td>Standard hourly (pay-as-you-go)</td><td>Reserved Instances, Savings Plans</td><td>Spot VMs</td></tr>
+<tr><td>OCI</td><td>Standard hourly (and notably, OCI dropped all outbound data-transfer/egress charges across its full footprint in early 2026)</td><td>Annual/multi-year Universal Credits and capacity reservations</td><td>Preemptible capacity (more limited than the other three)</td></tr>
+</table>
+<p>Egress cost is the sleeper issue in this table: moving trained checkpoints or datasets between clouds, or serving inference traffic out to the internet, is billed per-GB on AWS, GCP, and Azure and can dominate a multi-cloud bill; OCI's zero-egress policy is a genuine differentiator for teams that expect to move a lot of data out.</p>
+
+<h2>Which CSP Fits Which Use Case</h2>
+<table>
+<tr><th>Scenario</th><th>Reasonable fit</th><th>Why</th></tr>
+<tr><td>Largest possible single training run, bleeding-edge Blackwell rack-scale</td><td>AWS or Azure</td><td>Both have GB200/GB300 NVL72 UltraServer/ND-series GA at scale with dedicated non-blocking fabric designed for tens-of-thousands-of-GPU jobs</td></tr>
+<tr><td>Already standardized on Kubernetes/GKE, TPU+GPU mixed fleet</td><td>GCP</td><td>Cluster Toolkit and GKE integration are first-class; A3/A4 families are well-documented for both Slurm and GKE paths</td></tr>
+<tr><td>Enterprise shop already deep in Azure/Microsoft ecosystem (AD, Entra, existing ExpressRoute)</td><td>Azure</td><td>CycleCloud and ND-series integrate cleanly with existing Azure identity/networking investments; InfiniBand NDR fabric matches on-prem HPC expectations closely</td></tr>
+<tr><td>Cost-sensitive, heavy data egress, or bare-metal control preference</td><td>OCI</td><td>Zero egress fees and bare-metal-first shapes suit teams that want to avoid virtualization overhead and data-movement surprises</td></tr>
+<tr><td>Multi-cloud by procurement necessity (capacity-constrained GPU market)</td><td>All four, deliberately</td><td>In a supply-constrained GPU market, "whichever CSP has capacity when you need it" is frequently the deciding factor over any of the above — see the internal deep-dive for the operational reality of running this way</td></tr>
+</table>
+
+<svg class="diagram" viewBox="0 0 900 460" xmlns="http://www.w3.org/2000/svg">
+  <style>
+    .t{font:12px var(--font,sans-serif);fill:#e8edf4}
+    .td{font:11px var(--font,sans-serif);fill:#9fb0c3}
+    .th{font:14px var(--font,sans-serif);fill:#e8edf4;font-weight:700}
+  </style>
+  <rect width="900" height="460" fill="#141c2b"/>
+  <text x="20" y="28" class="th">Four CSPs — Relative Positioning</text>
+  <text x="20" y="48" class="td">Axes are directional, not precise benchmarks. X: turnkey tooling → composable/DIY. Y: newest-fabric-generation-first → broadest workload breadth.</text>
+
+  <line x1="120" y1="400" x2="820" y2="400" stroke="#25324a"/>
+  <line x1="120" y1="80" x2="120" y2="400" stroke="#25324a"/>
+  <text x="420" y="425" class="td">Turnkey tooling ← → Composable / IaC-first</text>
+  <text x="30" y="240" class="td" transform="rotate(-90 30 240)">Fabric-first ← → Breadth-first</text>
+
+  <!-- AWS -->
+  <circle cx="260" cy="150" r="12" fill="#ff9900"/>
+  <text x="280" y="146" class="t">AWS</text>
+  <text x="280" y="162" class="td">ParallelCluster, EFA, Capacity Blocks</text>
+
+  <!-- GCP -->
+  <circle cx="520" cy="220" r="12" fill="#4285f4"/>
+  <text x="540" y="216" class="t">GCP</text>
+  <text x="540" y="232" class="td">Cluster Toolkit, TCPX/TCPXO→RDMA</text>
+
+  <!-- Azure -->
+  <circle cx="300" cy="120" r="12" fill="#00a4ef"/>
+  <text x="320" y="116" class="t">Azure</text>
+  <text x="320" y="132" class="td">CycleCloud, InfiniBand NDR</text>
+
+  <!-- OCI -->
+  <circle cx="650" cy="320" r="12" fill="#c74634"/>
+  <text x="670" y="316" class="t">OCI</text>
+  <text x="670" y="332" class="td">Terraform-first, RoCE v2, zero egress</text>
+
+  <text x="120" y="450" class="td">Positioning reflects tooling philosophy and fabric maturity as of mid-2026, not a performance ranking.</text>
+</svg>
+
+<h2>Further Reading</h2>
+<ul>
+<li><a href="https://aws.amazon.com/ec2/ultraservers/">Amazon EC2 UltraServers — AWS</a></li>
+<li><a href="https://aws.amazon.com/about-aws/whats-new/2025/09/aws-parallelcluster-p6e-p6">AWS ParallelCluster 3.14 adds P6e-GB200 and P6-B200 instance types</a></li>
+<li><a href="https://docs.cloud.google.com/ai-hypercomputer/docs/evaluate-clustered-gpus">Clustered GPUs overview — Google Cloud AI Hypercomputer</a></li>
+<li><a href="https://docs.cloud.google.com/cluster-toolkit/docs/machine-learning/a3-mega-enable-gpudirect-tcpxo">Enable GPUDirect-TCPXO optimized NCCL communication — Cluster Toolkit</a></li>
+<li><a href="https://techcommunity.microsoft.com/blog/azurehighperformancecomputingblog/accelerating-the-intelligence-age-with-azure-ai-infrastructure-and-the-ga-of-nd-/4394575">Accelerating the Intelligence Age with Azure AI Infrastructure and the GA of ND GB200 v6</a></li>
+<li><a href="https://learn.microsoft.com/en-us/azure/virtual-machines/sizes/gpu-accelerated/ndh100v5-series">ND-H100-v5 size series — Azure Virtual Machines</a></li>
+<li><a href="https://www.oracle.com/cloud/compute/gpu/">GPU, Virtual Machines and Bare Metal — Oracle Cloud Infrastructure</a></li>
+<li><a href="https://blogs.oracle.com/cloud-infrastructure/now-ga-largest-ai-supercomputer-oci-nvidia-h200">Now Generally Available: The Largest, Fastest AI Supercomputer in the Cloud — OCI</a></li>
+</ul>
+
+<div class="section-nav"><a href="18-csp-oci.html">← CSP Build — OCI</a><a href="20-iac-terraform.html">Next: IaC — Terraform →</a></div>
+</main></div>
+<footer><div class="wrap">Part of the HPC Cluster Build Guide.</div></footer>
+</body>
+</html>

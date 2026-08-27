@@ -1,0 +1,105 @@
+<!DOCTYPE html>
+<html data-theme="dark">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Network Fabrics Deep-Dive: InfiniBand, RoCEv2, Slingshot, Omni-Path — HPC Cluster Build Guide</title>
+<link rel="stylesheet" href="../assets/css/style.css">
+</head>
+<body>
+<header class="top"><div class="wrap"><a href="../index.html">HPC Cluster Build Guide</a><span class="badge">Public Edition</span></div></header>
+<div class="wrap"><nav class="crumbs"><a href="13-end-to-end-build.html">← Full Build Walkthrough</a></nav>
+<main>
+
+<h1>Network Fabrics Deep-Dive: InfiniBand, RoCEv2, Slingshot, and Omni-Path</h1>
+<p class="lede">The Networking &amp; Fabric section earlier in this guide introduced RDMA and the two mainstream fabric choices — InfiniBand and RoCEv2 — at an intro level. This page goes one layer deeper: a side-by-side technical comparison of the four fabrics an HPC or AI cluster builder is actually likely to evaluate today — NVIDIA InfiniBand (NDR/XDR), RoCEv2 at scale, HPE Cray Slingshot, and Cornelis Networks' Omni-Path Express — plus how each behaves under real NCCL collective-communication traffic, and a worked example estimating all-reduce completion time across fabric choices for a fixed GPU count.</p>
+
+<h2>InfiniBand NDR and XDR</h2>
+<p>NVIDIA's Quantum-2 platform is the seventh generation of InfiniBand architecture and delivers <strong>NDR at 400 Gb/s per port</strong>: a QM9700-class switch packs 64 NDR ports into 1U for an aggregate bidirectional throughput of 51.2 Tb/s. The generation above it, <strong>Quantum-X800 (XDR)</strong>, doubles per-port speed to 800 Gb/s across 144 ports (72 OSFP cages) using 200 Gb/s-per-lane SerDes, with sub-100 ns port-to-port latency, and a single two-tier fat-tree can connect up to 10,368 ConnectX-8 NICs.</p>
+<p>Three mechanisms make InfiniBand distinctive at scale:</p>
+<ul>
+<li><strong>Subnet Manager (SM) scaling</strong> — a single logical Subnet Manager (OpenSM, or NVIDIA UFM for production fleets) computes routing tables for the entire fabric. As fabrics grow into the tens of thousands of ports, UFM's incremental/partial-rebuild routing and telemetry become essential to keep topology-change convergence fast; a naive full SM re-sweep on a huge fabric is measured in seconds, which matters when a link flaps mid-job.</li>
+<li><strong>Adaptive Routing (AR)</strong> — switches make per-packet or per-flow forwarding decisions based on real-time port load rather than a static hash, spreading traffic away from hot spots without operator intervention.</li>
+<li><strong>SHARP in-network compute</strong> — NVIDIA's Scalable Hierarchical Aggregation and Reduction Protocol performs reduction operations (the arithmetic inside an all-reduce) inside the switch ASICs themselves, rather than only at the endpoints. Quantum-X800's third/fourth-generation SHARP delivers 14.4 TFLOPS of in-network computing, which can roughly halve the data volume — and the completion time — of a large collective compared to a pure endpoint-based reduction.</li>
+</ul>
+
+<h2>RoCEv2 at Scale</h2>
+<p>RoCEv2 carries RDMA over standard Ethernet/UDP framing, so it can run on commodity switch silicon — but Ethernet was designed to drop packets under congestion, which RDMA cannot tolerate well. Making RoCEv2 lossless at scale requires two cooperating mechanisms, and each has a well-documented failure mode:</p>
+<ul>
+<li><strong>Priority Flow Control (PFC)</strong> pauses an entire priority class on a link when a switch's ingress buffer nears full. Because PFC pauses the whole class rather than a single flow, it can cause <strong>head-of-line blocking</strong> (unrelated flows sharing that priority queue stall behind the congested one) and, in topologies with cyclic buffer dependencies, a full <strong>PFC deadlock</strong> — several switches waiting on each other to drain buffers that never drain, freezing traffic permanently until intervention.</li>
+<li><strong>ECN + DCQCN</strong> is the fix layered on top: switches mark packets with Explicit Congestion Notification as queues approach (but don't yet reach) the PFC threshold, the receiver echoes a Congestion Notification Packet back to the sender, and the sender's rate is quantized down before PFC ever has to fire. Getting this right is a tuning exercise — the well-known ordering rule is <code>xON &lt; ECN-min &lt; ECN-max &lt; xOFF</code> on the switch buffer thresholds — and getting it wrong (thresholds too aggressive, or too loose) reintroduces the exact head-of-line blocking and unfairness problems DCQCN exists to prevent.</li>
+</ul>
+<p>NVIDIA's Spectrum-X platform (Spectrum-4 switches + BlueField-3/ConnectX-7/8 NICs) packages a pre-validated combination of PFC, ECN, and adaptive load balancing specifically to avoid hand-tuning this from scratch.</p>
+
+<h2>Slingshot (HPE Cray)</h2>
+<p>Slingshot is HPE Cray's eighth-generation interconnect, built around the Rosetta switch ASIC — 64 ports at 200 Gb/s per direction, using 56 Gb/s PAM-4 SerDes lanes — and it is Ethernet-interoperable at the physical/link layer while adding HPC-specific control-plane features on top. Two design choices set it apart from RoCEv2/PFC-based Ethernet:</p>
+<ul>
+<li><strong>Fine-grained adaptive routing with global congestion awareness</strong> — Rosetta switches evaluate multiple minimal and non-minimal paths in real time (particularly effective in Dragonfly topologies, Slingshot's most common deployment topology) and steer around congestion rather than following a fixed hash.</li>
+<li><strong>Per-flow congestion control instead of class-based pause</strong> — rather than PFC's blunt "pause this whole priority class," Slingshot tracks congestion state for thousands of individual flows and throttles only the specific flows contributing to a bottleneck, which is the architectural answer to the head-of-line-blocking problem that PFC-based Ethernet has to fight with careful ECN tuning instead.</li>
+</ul>
+<p>Slingshot deployments are concentrated in leadership-class HPC systems (e.g., Perlmutter, Frontier) and increasingly in HPE Cray AI supercomputer offerings, rather than in general commercial cloud AI infrastructure.</p>
+
+<h2>Omni-Path Express (Cornelis Networks)</h2>
+<p>Omni-Path Express is Cornelis Networks' revival and modernization of Intel's original Omni-Path architecture. The current CN5000 generation delivers 400 Gb/s per port (QSFP112), sub-1 microsecond MPI latency, and a message rate around 1.2 billion messages/second. It supports classic full/partial bisection-bandwidth fat-trees as well as Dragonfly and Megafly (Dragonfly+) topologies, and Cornelis states the architecture is designed to scale to roughly 330,000 nodes in a single cluster. Distinguishing features include dynamic adapter-driven routing and a design goal of "zero-latency" packet-integrity protection (forward error correction and retransmission engineered not to add pipeline latency). Cornelis also publishes an UltraEthernet-aligned roadmap, positioning Omni-Path Express as a bridge between classic HPC-fabric engineering and the emerging Ultra Ethernet Consortium standard.</p>
+
+<h2>Side-by-Side Comparison</h2>
+<table>
+<thead><tr><th>Dimension</th><th>InfiniBand NDR/XDR</th><th>RoCEv2 (Spectrum-X)</th><th>Slingshot</th><th>Omni-Path Express (CN5000)</th></tr></thead>
+<tbody>
+<tr><td>Peak throughput</td><td>400 Gb/s (NDR) → 800 Gb/s (XDR)</td><td>400–800 Gb/s (Spectrum-4 gen)</td><td>200 Gb/s per direction per port (Rosetta)</td><td>400 Gb/s per port</td></tr>
+<tr><td>Typical latency</td><td>Sub-100 ns port-to-port (XDR)</td><td>Low-microsecond, workload/config-dependent</td><td>Low-microsecond, competitive with IB in published studies</td><td>Sub-1 µs MPI latency</td></tr>
+<tr><td>Congestion control</td><td>Credit-based lossless link layer + Adaptive Routing + SHARP offload</td><td>PFC (pause) + ECN + DCQCN rate control</td><td>Per-flow hardware congestion control + adaptive routing (no class-wide pause)</td><td>Dynamic adapter-driven routing + integrity protection</td></tr>
+<tr><td>Typical deployer</td><td>Large dedicated AI/HPC superclusters</td><td>Cloud-native AI infra, mixed workloads</td><td>Leadership-class national labs / HPC centers, HPE AI systems</td><td>HPC centers seeking an Omni-Path-lineage alternative</td></tr>
+<tr><td>Cost profile</td><td>Premium, single-dominant-vendor pricing</td><td>Lower, commodity Ethernet economics</td><td>Premium, bundled with HPE Cray EX systems</td><td>Competitive, positioned against IB pricing</td></tr>
+<tr><td>Ecosystem maturity</td><td>Very mature, dominant AI-cluster fabric</td><td>Mature Ethernet ecosystem, RDMA tuning still maturing at extreme scale</td><td>Mature in HPC, narrow outside it</td><td>Early/re-emerging; small but growing installed base</td></tr>
+</tbody>
+</table>
+
+<h2>Fabric Comparison — Relative Positioning</h2>
+<svg class="diagram" viewBox="0 0 900 300" xmlns="http://www.w3.org/2000/svg">
+  <text x="450" y="26" text-anchor="middle" fill="#e8edf4" font-size="15" font-weight="700">Four Fabrics: Ecosystem Breadth vs. Peak Per-Port Speed</text>
+  <line x1="100" y1="250" x2="800" y2="250" stroke="#4a5a72" stroke-width="1.5"/>
+  <line x1="100" y1="250" x2="100" y2="50" stroke="#4a5a72" stroke-width="1.5"/>
+  <text x="450" y="280" text-anchor="middle" fill="#9fb0c3" font-size="12">Ecosystem / vendor breadth →</text>
+  <text x="40" y="150" text-anchor="middle" fill="#9fb0c3" font-size="12" transform="rotate(-90 40 150)">Peak per-port speed ↑</text>
+  <circle cx="260" cy="90" r="9" fill="#76b900" stroke="#0d1420" stroke-width="2"/>
+  <text x="275" y="86" fill="#e8edf4" font-size="12">InfiniBand XDR (800G)</text>
+  <circle cx="560" cy="110" r="9" fill="#4fc3f7" stroke="#0d1420" stroke-width="2"/>
+  <text x="575" y="106" fill="#e8edf4" font-size="12">RoCEv2 / Spectrum-X (400-800G)</text>
+  <circle cx="220" cy="170" r="9" fill="#ffb74d" stroke="#0d1420" stroke-width="2"/>
+  <text x="235" y="166" fill="#e8edf4" font-size="12">Slingshot (200G/dir)</text>
+  <circle cx="340" cy="130" r="9" fill="#ff6b6b" stroke="#0d1420" stroke-width="2"/>
+  <text x="355" y="126" fill="#e8edf4" font-size="12">Omni-Path Express (400G)</text>
+  <text x="450" y="230" text-anchor="middle" fill="#9fb0c3" font-size="11">Position is directional; actual results depend on topology and tuning.</text>
+</svg>
+
+<h2>NCCL / Collective Performance Characteristics</h2>
+<p>All four fabrics can carry NCCL traffic via RDMA transports, but they behave differently under the specific traffic pattern of an all-reduce (ring or double-binary-tree exchange of large gradient tensors). InfiniBand's performance is generally reported as highly consistent run-to-run, because the lossless credit-based link layer removes retransmission jitter from the picture entirely; SHARP further reduces the effective data volume nodes have to move by performing partial reductions inside the switch fabric. RoCEv2 performance is more sensitive to fabric configuration quality — buffer tuning, ECN threshold placement, and background traffic mix all show up directly in NCCL all-reduce variance, which is why hyperscalers invest heavily in validated, pre-tuned stacks like Spectrum-X rather than hand-tuning DCQCN per deployment. Slingshot's per-flow congestion control tends to hold up well under mixed job traffic (multiple concurrent jobs sharing a Dragonfly fabric), a scenario where PFC-based fabrics are more exposed to head-of-line blocking. For all fabrics, NCCL's double-binary-tree algorithm gives near-logarithmic latency scaling with node count, but the constant factor — and how gracefully it degrades under contention — is exactly where the fabric choice shows up.</p>
+
+<h2>Worked Example: All-Reduce Time for 512 GPUs Across Three Fabrics</h2>
+<div class="card">
+<p>Consider a 512-GPU job performing a ring all-reduce on a 1 GB gradient tensor per step (64 nodes × 8 GPUs, one 400G-class rail per GPU). A simplified ring all-reduce completion-time model is <code>T ≈ 2(N-1)/N × (S/B) + latency_term</code>, where N is the number of participants, S is the message size, and B is the achievable per-link bandwidth.</p>
+<p><strong>InfiniBand NDR (400 Gb/s, SHARP-accelerated):</strong> with SHARP offloading roughly half the reduction traffic into the switch fabric, achievable effective bandwidth is high and consistent; a representative measured completion time for this pattern is on the order of <strong>~1.8 ms</strong> per step at this scale.</p>
+<p><strong>RoCEv2 / Spectrum-X (400 Gb/s, well-tuned DCQCN):</strong> with a properly tuned fabric, achievable bandwidth approaches InfiniBand's, but the lack of in-network SHARP-style reduction and typically slightly higher tail latency under contention puts a representative completion time around <strong>~2.3 ms</strong> per step — roughly 25-30% slower than the SHARP-accelerated InfiniBand case at the same scale.</p>
+<p><strong>Slingshot (200 Gb/s per direction, per-flow congestion control):</strong> the lower raw per-port rate is the dominant factor; a representative completion time lands around <strong>~3.0 ms</strong> per step, though Slingshot's per-flow fairness means this number degrades more gracefully than a PFC-based fabric when multiple jobs share the network concurrently.</p>
+<p>These are illustrative, not lab-measured, numbers — the point of the exercise is the shape of the trade-off: raw per-port bandwidth sets the floor, in-network compute (SHARP) can meaningfully beat that floor, and congestion-control architecture determines how much of that theoretical number you actually keep once the fabric is shared and busy.</p>
+</div>
+
+<h2>Further Reading</h2>
+<ul>
+<li><a href="https://www.nvidia.com/en-us/networking/quantum2/">NVIDIA Quantum-2 InfiniBand Platform</a></li>
+<li><a href="https://www.nvidia.com/en-us/networking/products/infiniband/quantum-x800/">NVIDIA Quantum-X800 InfiniBand Platform (XDR)</a></li>
+<li><a href="https://www.ipinfusion.com/technology/dcqcn/">DCQCN: RoCEv2 Congestion Control — IP Infusion</a></li>
+<li><a href="https://www.naddod.com/blog/pfc-flow-control-technology-and-challenges-in-rocev2-network-deployment">PFC Flow Control Technology and Challenges in RoCEv2 Network Deployment — NADDOD</a></li>
+<li><a href="https://arxiv.org/pdf/2008.08886">An In-Depth Analysis of the Slingshot Interconnect — De Sensi et al.</a></li>
+<li><a href="https://www.hpe.com/psnow/downloadDoc/HPE%20Slingshot%20QuickSpecs-a50002546enw.pdf">HPE Slingshot QuickSpecs</a></li>
+<li><a href="https://www.cornelisnetworks.com/pdf-archive/2023/11/CN5000_Family_Product_Brief_A00337.pdf">Cornelis CN5000 Omni-Path Product Family Brief</a></li>
+<li><a href="https://www.servethehome.com/cornelis-cn5000-400gbps-omni-path-launched-with-ultraethernet-roadmap/">Cornelis CN5000 400Gbps Omni-Path Launch — ServeTheHome</a></li>
+<li><a href="https://arxiv.org/html/2507.04786v1">Demystifying NCCL: An In-Depth Analysis of GPU Communication Protocols and Algorithms</a></li>
+</ul>
+
+<div class="section-nav"><a href="13-end-to-end-build.html">← Full Build Walkthrough</a><a href="15-csp-aws.html">Next: CSP Build — AWS →</a></div>
+</main></div>
+<footer><div class="wrap">Part of the HPC Cluster Build Guide.</div></footer>
+</body>
+</html>

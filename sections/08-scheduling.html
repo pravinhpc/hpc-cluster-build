@@ -1,0 +1,366 @@
+<!DOCTYPE html>
+<html data-theme="dark" lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>08 — Job Schedulers: Slurm, PBS, and LSF | HPC Cluster Build Guide</title>
+<link rel="stylesheet" href="../assets/css/style.css">
+</head>
+<body>
+<header class="top"><div class="wrap"><a href="../index.html">HPC Cluster Build Guide</a><span class="badge">Public Edition</span></div></header>
+<div class="wrap">
+<nav class="crumbs"><a href="07-provisioning-baremetal-ansible.html">← Bare-metal with Ansible</a></nav>
+<main>
+
+<h1>08 — Job Schedulers: Slurm, PBS, and LSF</h1>
+<p class="lede">A cluster full of provisioned, networked, storage-attached nodes is just expensive furniture until something decides <em>who</em> gets to run <em>what</em>, <em>where</em>, and <em>when</em>. That "something" is the workload manager — the piece of software every user actually touches. This section covers why HPC clusters need one, does a deep dive on Slurm (the dominant choice for modern GPU/AI clusters), and gives practical overviews of PBS and LSF as alternatives.</p>
+
+<h2>Why HPC clusters need a workload manager</h2>
+<p>Picture a 200-node GPU cluster shared by 40 researchers and a dozen production training pipelines. Without a scheduler, "running a job" means SSH-ing into a node and hoping nobody else had the same idea. That breaks down almost immediately:</p>
+<div class="card">
+<ul>
+<li><strong>Resource allocation.</strong> Someone has to track which GPUs, CPU cores, and memory are free right now, and hand out exclusive or shared slices of them so two jobs don't collide on the same GPU.</li>
+<li><strong>Queuing.</strong> When demand exceeds supply (it always does), jobs need to wait in an orderly line rather than fail outright or silently oversubscribe hardware.</li>
+<li><strong>Fairness.</strong> One team submitting 10,000 jobs shouldn't be able to starve every other team for a month. Fair-share accounting balances historical usage against current demand.</li>
+<li><strong>Multi-tenant scheduling.</strong> Different teams, priorities, and budgets ("this account gets 30% of the H100s") need to coexist on the same physical hardware with policy enforcement, not gentlemen's agreements.</li>
+<li><strong>Accounting &amp; auditing.</strong> Someone will eventually ask "who used the cluster last month and for how many GPU-hours" — for chargeback, for capacity planning, or for a grant report.</li>
+</ul>
+</div>
+
+<div class="callout tip">
+<div class="label">Slurm / PBS / LSF vs. Kubernetes</div>
+<p>Kubernetes solves a related but different problem: long-running, self-healing, loosely-coupled microservices with declarative desired state and rolling updates. HPC/AI workload managers solve <em>tightly-coupled, finite-duration, batch</em> jobs — an MPI job or a multi-node training run where all ranks must start together, communicate over low-latency fabrics (InfiniBand/RoCE), and where the job simply <em>finishes</em> rather than being kept "alive" forever. Slurm has first-class notions of job steps, exclusive node allocation, topology-aware placement, and backfill — things Kubernetes' scheduler doesn't natively do well. That said, the lines are blurring: many AI shops run Slurm on bare metal underneath and Kubernetes for inference/serving on top, or use projects like Slurm's <code>PMIx</code>/<code>pyxis</code> plugins and Kubernetes operators (e.g. the Slurm-on-Kubernetes and MPI Operator projects) to bridge the two. For batch HPC/AI training at scale, Slurm (or PBS/LSF) remains the default choice.</p>
+</div>
+
+<h2>Deep dive: Slurm</h2>
+<p>Slurm (Simple Linux Utility for Resource Management), maintained by SchedMD, is the most widely deployed workload manager in modern GPU and AI training clusters — it runs on a majority of TOP500 systems and is the scheduler underneath most large NVIDIA DGX SuperPOD and cloud GPU cluster reference architectures.</p>
+
+<h3>Core architecture</h3>
+<p>Slurm's design is deliberately simple: a central brain, an agent on every node, and a shared trust mechanism between them.</p>
+
+<svg class="diagram" viewBox="0 0 900 400" role="img" aria-label="Slurm architecture diagram showing slurmctld, slurmdbd, munge, and slurmd daemons across nodes">
+  <style>
+    .box{fill:#1a2437;stroke:#25324a;stroke-width:1.5}
+    .accent{fill:#141c2b;stroke:#76b900;stroke-width:2}
+    .lbl{fill:#e8edf4;font-family:sans-serif;font-size:14px;font-weight:600}
+    .sub{fill:#9fb0c3;font-family:sans-serif;font-size:11px}
+    .arrow{stroke:#4fc3f7;stroke-width:2;fill:none;marker-end:url(#arrow08)}
+    .arrow2{stroke:#76b900;stroke-width:2;fill:none;marker-end:url(#arrow08g)}
+  </style>
+  <defs>
+    <marker id="arrow08" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6 Z" fill="#4fc3f7"/></marker>
+    <marker id="arrow08g" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6 Z" fill="#76b900"/></marker>
+  </defs>
+
+  <rect x="340" y="20" width="220" height="60" rx="8" class="accent"/>
+  <text x="450" y="45" text-anchor="middle" class="lbl">slurmctld</text>
+  <text x="450" y="62" text-anchor="middle" class="sub">central controller — scheduling, state</text>
+
+  <rect x="600" y="20" width="220" height="60" rx="8" class="box"/>
+  <text x="710" y="45" text-anchor="middle" class="lbl">slurmdbd</text>
+  <text x="710" y="62" text-anchor="middle" class="sub">accounting DB (MySQL/MariaDB)</text>
+
+  <rect x="80" y="20" width="200" height="60" rx="8" class="box"/>
+  <text x="180" y="45" text-anchor="middle" class="lbl">munge daemon</text>
+  <text x="180" y="62" text-anchor="middle" class="sub">shared-key message auth</text>
+
+  <line x1="280" y1="50" x2="340" y2="50" class="arrow"/>
+  <line x1="560" y1="50" x2="600" y2="50" class="arrow"/>
+
+  <rect x="60" y="180" width="160" height="70" rx="8" class="box"/>
+  <text x="140" y="208" text-anchor="middle" class="lbl">slurmd</text>
+  <text x="140" y="225" text-anchor="middle" class="sub">compute node 001</text>
+  <text x="140" y="240" text-anchor="middle" class="sub">munge + cgroups</text>
+
+  <rect x="260" y="180" width="160" height="70" rx="8" class="box"/>
+  <text x="340" y="208" text-anchor="middle" class="lbl">slurmd</text>
+  <text x="340" y="225" text-anchor="middle" class="sub">compute node 002</text>
+  <text x="340" y="240" text-anchor="middle" class="sub">munge + cgroups</text>
+
+  <rect x="460" y="180" width="160" height="70" rx="8" class="box"/>
+  <text x="540" y="208" text-anchor="middle" class="lbl">slurmd</text>
+  <text x="540" y="225" text-anchor="middle" class="sub">compute node 003</text>
+  <text x="540" y="240" text-anchor="middle" class="sub">munge + cgroups</text>
+
+  <rect x="660" y="180" width="160" height="70" rx="8" class="box"/>
+  <text x="740" y="208" text-anchor="middle" class="lbl">slurmd</text>
+  <text x="740" y="225" text-anchor="middle" class="sub">compute node N (GPUs)</text>
+  <text x="740" y="240" text-anchor="middle" class="sub">gres.conf: gpu:8</text>
+
+  <line x1="420" y1="80" x2="140" y2="180" class="arrow2"/>
+  <line x1="440" y1="80" x2="340" y2="180" class="arrow2"/>
+  <line x1="460" y1="80" x2="540" y2="180" class="arrow2"/>
+  <line x1="480" y1="80" x2="740" y2="180" class="arrow2"/>
+
+  <rect x="240" y="300" width="420" height="70" rx="8" class="box"/>
+  <text x="450" y="328" text-anchor="middle" class="lbl">login / submit node</text>
+  <text x="450" y="346" text-anchor="middle" class="sub">sbatch / srun / salloc / squeue / scancel</text>
+  <text x="450" y="362" text-anchor="middle" class="sub">talks to slurmctld over RPC (munge-signed)</text>
+
+  <line x1="450" y1="300" x2="450" y2="80" class="arrow" stroke-dasharray="4,3"/>
+</svg>
+
+<div class="grid2">
+<div class="card">
+<h3 style="margin-top:0">slurmctld — the controller</h3>
+<p><a href="https://slurm.schedmd.com/slurmctld.html">slurmctld</a> is Slurm's central management daemon: it monitors resources and nodes, accepts submitted jobs, and decides which jobs get which resources and when. It typically runs on one or two dedicated "controller" nodes (a backup <code>slurmctld</code> can take over on failure) and is the single source of truth for cluster state.</p>
+</div>
+<div class="card">
+<h3 style="margin-top:0">slurmd — the node agent</h3>
+<p><code>slurmd</code> runs on every compute node. Per SchedMD's documentation, it behaves like a remote shell: it waits for work, executes it, returns status, and waits for more — while participating in Slurm's fault-tolerant hierarchical communication tree so a single controller can manage thousands of nodes without a communication bottleneck.</p>
+</div>
+</div>
+
+<div class="grid2">
+<div class="card">
+<h3 style="margin-top:0">munge — authentication</h3>
+<p>MUNGE (MUNGE Uid 'N' Gid Emporium) is Slurm's default authentication mechanism. Every host in the cluster shares a cryptographic key (<code>/etc/munge/munge.key</code>); the <code>munged</code> daemon signs and verifies RPC messages between <code>slurmctld</code>, <code>slurmd</code>, and client commands so a node can't forge a job submission or impersonate another user. If munge's clocks drift or the key is out of sync across nodes, authentication fails cluster-wide — it's usually the first thing to check when <code>squeue</code> hangs after a new node join.</p>
+</div>
+<div class="card">
+<h3 style="margin-top:0">slurmdbd — accounting</h3>
+<p>The optional Slurm Database Daemon stores historical job accounting, fair-share usage, and association (user/account/QOS) data in MySQL or MariaDB. It's what <code>sacct</code> and fair-share priority calculations read from, and it's required for multi-cluster federation and detailed chargeback reporting.</p>
+</div>
+</div>
+
+<h3>Partitions and QOS</h3>
+<p>A <strong>partition</strong> (Slurm's word for a queue) is a named subset of nodes with its own limits — e.g. a <code>gpu</code> partition for GPU-equipped nodes and a <code>cpu</code> partition for everything else, or <code>debug</code> vs. <code>batch</code> with different max walltimes. A <strong>QOS</strong> (Quality of Service) is an orthogonal policy object — it can raise or lower job priority, cap the number of GPUs a group of users can hold at once, or grant preemption rights — and can be layered on top of any partition. A common pattern: a <code>high-priority</code> QOS for production training jobs that preempts a <code>best-effort</code> QOS used for exploratory notebooks.</p>
+
+<h3>Submitting work</h3>
+<p>Slurm gives you three main entry points:</p>
+<div class="card">
+<ul>
+<li><code>sbatch</code> — submit a batch script that runs asynchronously; Slurm queues it and returns immediately with a job ID.</li>
+<li><code>srun</code> — run a job step, either standalone (blocking, interactive-feeling) or inside an <code>sbatch</code> script to launch parallel tasks across allocated nodes.</li>
+<li><code>salloc</code> — obtain a resource allocation interactively (e.g. for debugging), then run commands or drop into a shell on the allocated nodes.</li>
+</ul>
+</div>
+
+<h3>Scheduling policies</h3>
+<p>Slurm's default scheduler is the <a href="https://slurm.schedmd.com/priority_multifactor.html">multifactor priority plugin</a>. Each pending job gets a priority score that blends several weighted factors — age (how long it's waited), fair-share (how much the submitting account/user has already consumed relative to its allocated share), job size, partition, and QOS. On top of ordering, the <strong>backfill</strong> scheduler is what keeps utilization high: it looks past the head of the queue and starts smaller, lower-priority jobs early — as long as doing so won't delay the expected start time of the higher-priority job at the front of the queue. This is why a big 512-GPU job can be "next in line" for hours while short single-GPU jobs keep slipping in around it without ever pushing the big job back.
+
+<svg class="diagram" viewBox="0 0 900 400" role="img" aria-label="Slurm job lifecycle state diagram from PENDING to COMPLETED, showing backfill">
+  <style>
+    .st{fill:#141c2b;stroke:#25324a;stroke-width:1.5}
+    .stA{fill:#141c2b;stroke:#76b900;stroke-width:2}
+    .t{fill:#e8edf4;font-family:sans-serif;font-size:14px;font-weight:600}
+    .s{fill:#9fb0c3;font-family:sans-serif;font-size:11px}
+    .fl{stroke:#4fc3f7;stroke-width:2;fill:none;marker-end:url(#a2)}
+    .fb{stroke:#ffb74d;stroke-width:2;fill:none;marker-end:url(#a3);stroke-dasharray:5,4}
+  </style>
+  <defs>
+    <marker id="a2" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6 Z" fill="#4fc3f7"/></marker>
+    <marker id="a3" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6 Z" fill="#ffb74d"/></marker>
+  </defs>
+
+  <rect x="40" y="160" width="150" height="70" rx="10" class="st"/>
+  <text x="115" y="190" text-anchor="middle" class="t">PENDING</text>
+  <text x="115" y="207" text-anchor="middle" class="s">queued, waiting on</text>
+  <text x="115" y="220" text-anchor="middle" class="s">priority + resources</text>
+
+  <rect x="280" y="160" width="150" height="70" rx="10" class="stA"/>
+  <text x="355" y="190" text-anchor="middle" class="t">RUNNING</text>
+  <text x="355" y="207" text-anchor="middle" class="s">allocated nodes,</text>
+  <text x="355" y="220" text-anchor="middle" class="s">executing steps</text>
+
+  <rect x="520" y="160" width="150" height="70" rx="10" class="st"/>
+  <text x="595" y="190" text-anchor="middle" class="t">COMPLETING</text>
+  <text x="595" y="207" text-anchor="middle" class="s">epilog running,</text>
+  <text x="595" y="220" text-anchor="middle" class="s">cgroup teardown</text>
+
+  <rect x="750" y="160" width="130" height="70" rx="10" class="st"/>
+  <text x="815" y="190" text-anchor="middle" class="t">COMPLETED</text>
+  <text x="815" y="207" text-anchor="middle" class="s">exit 0, recorded</text>
+  <text x="815" y="220" text-anchor="middle" class="s">to slurmdbd</text>
+
+  <line x1="190" y1="195" x2="280" y2="195" class="fl"/>
+  <line x1="430" y1="195" x2="520" y2="195" class="fl"/>
+  <line x1="670" y1="195" x2="750" y2="195" class="fl"/>
+
+  <rect x="40" y="300" width="230" height="60" rx="10" class="st"/>
+  <text x="155" y="325" text-anchor="middle" class="t">Backfill window</text>
+  <text x="155" y="342" text-anchor="middle" class="s">small job slots into idle gap</text>
+
+  <path d="M115,300 C115,270 300,270 355,232" class="fb"/>
+  <text x="230" y="265" text-anchor="middle" class="s" fill="#ffb74d">backfill scheduler picks a</text>
+  <text x="230" y="278" text-anchor="middle" class="s" fill="#ffb74d">small PENDING job early</text>
+
+  <rect x="520" y="300" width="200" height="60" rx="10" class="st" stroke="#ff6b6b"/>
+  <text x="620" y="325" text-anchor="middle" class="t">FAILED / TIMEOUT /</text>
+  <text x="620" y="342" text-anchor="middle" class="t">CANCELLED / NODE_FAIL</text>
+  <path d="M355,230 L620,300" class="fl" stroke="#ff6b6b" marker-end="none"/>
+</svg>
+</p>
+
+<h3>GPU resource tracking with GRES</h3>
+<p>Slurm tracks GPUs (and other non-CPU resources like MPS shards) through the <a href="https://slurm.schedmd.com/gres.html">Generic Resource (GRES)</a> plugin framework. Nothing is tracked by default — an admin must declare <code>GresTypes=gpu</code> in <code>slurm.conf</code> and list per-node GPU counts/types in <code>gres.conf</code>. Users then request GPUs at submission time, e.g. <code>sbatch --gres=gpu:a100:2</code>, and Slurm binds the job to specific GPU device files via cgroups so a job can never see or touch a GPU it wasn't allocated.</p>
+
+<h3>Isolation with cgroups</h3>
+<p>Slurm's <code>cgroup</code> plugin (via <code>cgroup.conf</code>) uses Linux control groups to enforce what a job actually gets: it constrains a job's tasks to their allocated CPU cores, caps memory so one job's OOM doesn't take down a neighbor, and restricts device access so GPU allocations from GRES are actually enforced at the kernel level rather than just "agreed on by convention." This is the mechanism that makes multi-tenant GPU sharing on a single node safe.</p>
+
+<h2>Worked example: a multi-node GPU training job</h2>
+<p>Here's a realistic end-to-end flow for training a model across 4 nodes × 8 GPUs each, using PyTorch's distributed launcher.</p>
+
+<pre><code>#!/bin/bash
+#SBATCH --job-name=llm-pretrain
+#SBATCH --partition=gpu
+#SBATCH --qos=high-priority
+#SBATCH --account=research-team-a
+#SBATCH --nodes=4
+#SBATCH --ntasks-per-node=8
+#SBATCH --gres=gpu:h100:8
+#SBATCH --cpus-per-task=16
+#SBATCH --mem=0                     # request all available memory on the node
+#SBATCH --time=08:00:00
+#SBATCH --exclusive
+#SBATCH --output=logs/%x-%j.out
+#SBATCH --error=logs/%x-%j.err
+
+set -euo pipefail
+
+echo "Job $SLURM_JOB_ID starting on $SLURM_JOB_NUM_NODES nodes"
+scontrol show hostnames "$SLURM_JOB_NODELIST" > logs/hostfile-$SLURM_JOB_ID.txt
+
+export MASTER_ADDR=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n1)
+export MASTER_PORT=29500
+export NCCL_DEBUG=WARN
+export NCCL_SOCKET_IFNAME=ib0
+
+srun --gres=gpu:h100:8 --ntasks-per-node=8 --cpus-per-task=16 \
+  torchrun \
+    --nnodes="$SLURM_JOB_NUM_NODES" \
+    --nproc_per_node=8 \
+    --rdzv_id="$SLURM_JOB_ID" \
+    --rdzv_backend=c10d \
+    --rdzv_endpoint="${MASTER_ADDR}:${MASTER_PORT}" \
+    train.py --config configs/llm_pretrain.yaml
+</code></pre>
+
+<p>Submit and monitor it:</p>
+<pre><code>$ sbatch train_job.sbatch
+Submitted batch job 184223
+
+$ squeue -u $USER
+  JOBID PARTITION     NAME     USER  ST       TIME  NODES NODELIST(REASON)
+ 184223       gpu llm-pret  pkumar   R       0:42      4 gpu-node[012-015]
+
+$ scontrol show job 184223 | grep -E 'JobState|NumNodes|Gres'
+   JobState=RUNNING Reason=None Dependency=(null)
+   NumNodes=4 NumCPUs=512 NumTasks=32
+   TresPerNode=gres:gpu:h100:8
+
+$ sacct -j 184223 --format=JobID,JobName,Elapsed,State,ExitCode,MaxRSS
+JobID           JobName    Elapsed      State ExitCode     MaxRSS
+------------ ---------- ---------- ---------- -------- ----------
+184223         llm-pret   00:41:18    RUNNING      0:0
+184223.batch      batch   00:41:18    RUNNING      0:0
+184223.0            srun   00:41:15    RUNNING      0:0
+
+$ scancel 184223          # if you need to kill it
+</code></pre>
+
+<p>A minimal admin-side <code>slurm.conf</code> and <code>gres.conf</code> pair for a small GPU partition looks like:</p>
+
+<pre><code># /etc/slurm/slurm.conf (excerpt)
+ClusterName=demo-cluster
+SlurmctldHost=ctrl01
+AuthType=auth/munge
+SchedulerType=sched/backfill
+SelectType=select/cons_tres
+SelectTypeParameters=CR_Core_Memory
+ProctrackType=proctrack/cgroup
+TaskPlugin=task/cgroup
+GresTypes=gpu
+
+PriorityType=priority/multifactor
+PriorityWeightAge=1000
+PriorityWeightFairshare=10000
+PriorityWeightJobSize=1000
+PriorityWeightPartition=1000
+PriorityWeightQOS=2000
+
+NodeName=gpu-node[012-015] CPUs=128 Sockets=2 CoresPerSocket=64 \
+  ThreadsPerCore=1 RealMemory=1024000 Gres=gpu:h100:8 State=UNKNOWN
+
+PartitionName=gpu Nodes=gpu-node[012-015] Default=NO MaxTime=24:00:00 State=UP
+
+# /etc/slurm/gres.conf (excerpt, on each GPU node)
+AutoDetect=nvml
+Name=gpu Type=h100 File=/dev/nvidia[0-7]
+</code></pre>
+
+<div class="callout warn">
+<div class="label">Troubleshooting: deadlocks and starvation</div>
+<ul>
+<li><strong>Job stuck PENDING with reason <code>Resources</code>:</strong> usually correct — it's waiting for enough free nodes/GPUs; check <code>squeue --start</code> for an estimated start time and confirm backfill can see it (small jobs shouldn't wait behind it forever).</li>
+<li><strong>Job stuck with reason <code>Priority</code>:</strong> other jobs simply outrank it. Check <code>sprio -j &lt;jobid&gt;</code> to see the fair-share/age/QOS breakdown and confirm the account's fair-share usage isn't saturated.</li>
+<li><strong>Classic circular-wait starvation:</strong> a large job (e.g. needing all 4 nodes) can wait indefinitely if a stream of smaller jobs keeps backfilling ahead of it and resetting the "idle gap." Mitigate with <code>SchedulerParameters=bf_max_job_test</code> tuning, a dedicated reservation, or raising the big job's priority/QOS so backfill respects its expected start time.</li>
+<li><strong>Nodes stuck in <code>DRAIN</code> or <code>DOWN</code>:</strong> check <code>sinfo -R</code> for the drain reason, then <code>scontrol update NodeName=gpu-node012 State=RESUME</code> once the underlying issue (bad GPU, failed health check, full disk) is fixed.</li>
+<li><strong>Munge auth failures after adding a node:</strong> verify <code>munge.key</code> matches across all nodes and that clocks are in sync (NTP/chrony) — munge rejects messages with too much clock skew.</li>
+<li><strong>Job appears RUNNING but produces no output:</strong> check the epilog/prolog scripts and cgroup limits — an OOM-killed rank inside an MPI job can leave the job "running" while other ranks hang waiting on a collective.</li>
+</ul>
+</div>
+
+<h2>Alternatives: PBS and LSF</h2>
+<p>Slurm dominates new GPU/AI cluster builds, but PBS and LSF remain common — especially in sites with long institutional history, specific ISV software certifications, or existing licensing relationships.</p>
+
+<div class="grid2">
+<div class="card">
+<h3 style="margin-top:0">PBS Professional / OpenPBS</h3>
+<p>Originally developed at NASA, <a href="https://github.com/openpbs/openpbs">OpenPBS</a> is the open-source core of Altair's commercial PBS Professional. Jobs are submitted with <code>qsub</code>, using <code>#PBS</code> directives inside the script (analogous to Slurm's <code>#SBATCH</code>) for resource requests like <code>-l select=4:ncpus=32:ngpus=8</code>. It's popular in traditional national-lab and manufacturing/CFD HPC centers, and is well regarded for fine-grained job arrays (<code>qsub -J 1-100</code>) and mature commercial support (Altair) alongside the OpenPBS community edition.</p>
+</div>
+<div class="card">
+<h3 style="margin-top:0">IBM Spectrum LSF</h3>
+<p><a href="https://www.ibm.com/docs/en/spectrum-lsf">IBM Spectrum LSF</a> (originally Platform LSF) submits jobs with <code>bsub</code>. It's strong in heterogeneous, cross-platform enterprise environments (Unix and Windows hosts together), has deep roots in EDA/chip-design and financial-services compute farms, and offers sophisticated load-index-based dispatch (choosing hosts by real-time CPU/memory/IO load rather than static slot counts). Sites already standardized on LSF for CPU workloads sometimes extend it to GPU/AI queues rather than run two schedulers.</p>
+</div>
+</div>
+
+<table>
+<thead><tr><th>Aspect</th><th>Slurm</th><th>PBS Professional / OpenPBS</th><th>IBM Spectrum LSF</th></tr></thead>
+<tbody>
+<tr><td>Submit command</td><td><code>sbatch</code> / <code>srun</code> / <code>salloc</code></td><td><code>qsub</code></td><td><code>bsub</code></td></tr>
+<tr><td>Queue equivalent</td><td>Partition</td><td>Queue</td><td>Queue</td></tr>
+<tr><td>Status command</td><td><code>squeue</code>, <code>sacct</code></td><td><code>qstat</code></td><td><code>bjobs</code>, <code>bhist</code></td></tr>
+<tr><td>Cancel command</td><td><code>scancel</code></td><td><code>qdel</code></td><td><code>bkill</code></td></tr>
+<tr><td>GPU resource model</td><td>GRES (<code>gres.conf</code> + <code>--gres=gpu:N</code>)</td><td><code>-l select=...:ngpus=N</code></td><td><code>bsub -gpu</code> resource requirement string</td></tr>
+<tr><td>Backfill scheduling</td><td>Built-in, widely tuned for HPC/AI</td><td>Supported, configurable</td><td>Supported via scheduling policies</td></tr>
+<tr><td>Typical strength</td><td>GPU/AI training clusters, TOP500-scale, open-source dominance</td><td>Traditional HPC/CFD, job arrays, ISV certification</td><td>Heterogeneous enterprise farms, EDA, load-based dispatch</td></tr>
+<tr><td>License model</td><td>Open source (GPL); commercial support via SchedMD</td><td>Open source (OpenPBS) or commercial (PBS Pro, Altair)</td><td>Commercial (IBM)</td></tr>
+</tbody>
+</table>
+
+<div class="callout field">
+<div class="label">Field note</div>
+<p>If you're standing up a new GPU/AI cluster today with no strong existing vendor relationship, Slurm is the default choice for most reference architectures (including NVIDIA's own DGX SuperPOD and Base Command deployment guides) — it has the deepest GPU-aware scheduling ecosystem (GRES, topology plugins, <code>pyxis</code>/<code>enroot</code> container integration, NCCL-aware placement) and the largest community of people who already know how to operate it.</p>
+</div>
+
+<h2>Further Reading</h2>
+<ul>
+<li><a href="https://slurm.schedmd.com/overview.html">Slurm Overview — SchedMD</a></li>
+<li><a href="https://slurm.schedmd.com/slurmctld.html">slurmctld man page — SchedMD</a></li>
+<li><a href="https://slurm.schedmd.com/slurmd.html">slurmd man page — SchedMD</a></li>
+<li><a href="https://slurm.schedmd.com/authentication.html">Slurm Authentication Plugins (MUNGE)</a></li>
+<li><a href="https://slurm.schedmd.com/slurm.conf.html">slurm.conf documentation</a></li>
+<li><a href="https://slurm.schedmd.com/gres.html">Generic Resource (GRES) Scheduling</a></li>
+<li><a href="https://slurm.schedmd.com/gres.conf.html">gres.conf documentation</a></li>
+<li><a href="https://slurm.schedmd.com/cgroup.conf.html">cgroup.conf documentation</a></li>
+<li><a href="https://slurm.schedmd.com/priority_multifactor.html">Multifactor Priority Plugin (fair-share, backfill weighting)</a></li>
+<li><a href="https://slurm.schedmd.com/sbatch.html">sbatch documentation</a></li>
+<li><a href="https://slurm.schedmd.com/srun.html">srun documentation</a></li>
+<li><a href="https://slurm.schedmd.com/salloc.html">salloc documentation</a></li>
+<li><a href="https://slurm.schedmd.com/quickstart_admin.html">Slurm Quick Start Administrator Guide</a></li>
+<li><a href="https://github.com/openpbs/openpbs">OpenPBS on GitHub</a></li>
+<li><a href="https://github.com/openpbs/openpbs/blob/master/doc/man1/qsub.1B">OpenPBS qsub man page</a></li>
+<li><a href="https://www.ibm.com/docs/en/spectrum-lsf/10.1.0?topic=cr-bsub">IBM Spectrum LSF — bsub command reference</a></li>
+<li><a href="https://www.ibm.com/docs/en/spectrum-lsf/10.1.0?topic=lsf-run-jobs">IBM Spectrum LSF — Running Jobs</a></li>
+</ul>
+
+<div class="section-nav">
+<a href="07-provisioning-baremetal-ansible.html">← Bare-metal with Ansible</a>
+<a href="09-identity-ldap.html">Next: LDAP Integration →</a>
+</div>
+
+</main>
+</div>
+<footer><div class="wrap">Part of the HPC Cluster Build Guide.</div></footer>
+</body>
+</html>

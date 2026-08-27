@@ -1,0 +1,269 @@
+<!DOCTYPE html>
+<html data-theme="dark" lang="en">
+<head>
+<meta charset="UTF-8">
+<title>06 — Cluster Provisioning with Warewulf + OpenHPC | HPC Cluster Build Guide</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="../assets/css/style.css">
+</head>
+<body>
+<header class="top"><div class="wrap"><a href="../index.html">HPC Cluster Build Guide</a><span class="badge">Public Edition</span></div></header>
+<div class="wrap"><nav class="crumbs"><a href="05-provisioning-xcat.html">← Provisioning with xCAT</a></nav>
+<main>
+
+<h1>06 — Cluster Provisioning with Warewulf + OpenHPC</h1>
+<p class="lede">If BCM is the polished commercial product and xCAT is the venerable 20-year-old toolbox, Warewulf + OpenHPC is the "modern open-source native" path: a lightweight, container-image-based provisioning tool paired with a curated, pre-tested stack of HPC software. Together they're the closest thing the open-source HPC world has to a documented, reproducible recipe for going from bare metal to a working Slurm cluster — for the cost of your own time.</p>
+
+<h2>What are Warewulf and OpenHPC, really?</h2>
+<p><strong>Warewulf</strong> is a cluster provisioning system, currently on major version 4 (a ground-up rewrite from the Warewulf 3 era). Its whole philosophy is stateless-first: instead of installing an OS to each compute node's disk, Warewulf builds a single <strong>container image</strong> — a normal OCI/Docker-style root filesystem — and PXE-boots every compute node straight into that image over the network. There's no per-node install step, no drift between nodes, and no need for local disks at all on the compute fleet. Warewulf 4 replaced the old Warewulf 3 toolchain (<code>wwsh</code>, <code>wwbootstrap</code>, <code>wwmkchroot</code>, <code>wwvnfs</code>) with a single unified CLI: <code>wwctl</code>.</p>
+<p><strong>OpenHPC</strong>, on the other hand, isn't a provisioning tool at all — it's a curated software distribution: a large, pre-built, pre-tested set of RPM packages covering everything a cluster needs above bare Linux — Slurm, compilers (GNU, and optionally Intel/LLVM toolchains), MPI libraries (OpenMPI, MPICH, MVAPICH), performance tools, and provisioning "recipes" that glue a base OS + Warewulf (or xCAT) + Slurm together into a documented build. OpenHPC is a community project hosted by the Linux Foundation, with contributions from Intel, Dell, Lenovo, and various national labs and universities.</p>
+<p>The two are not the same layer, and that's the point: Warewulf answers "how do bits get onto a bare-metal node," OpenHPC answers "which HPC software, at which tested versions, goes into that image." OpenHPC's official install guides (the "Cluster Building Recipes" PDFs) are written specifically against Warewulf as the reference provisioning backend, which is why the two are almost always discussed together.</p>
+
+<div class="callout tip">
+<div class="label">Why this pairing is popular</div>
+Warewulf + OpenHPC is entirely free and open source, has no vendor lock-in, and is directly documented by the OpenHPC project itself with version-pinned "recipe" PDFs for specific OS + Warewulf + Slurm combinations. It's the path of choice for university clusters, national labs, and anyone who wants to understand — and own — every layer of their stack rather than depend on a commercial platform.
+</div>
+
+<h2>Core concepts</h2>
+
+<h3>Container images (the node's root filesystem)</h3>
+<p>In Warewulf 4, what used to be called a "VNFS image" in Warewulf 3 is now simply a <strong>container</strong>. You build it by importing a base OS container from any OCI registry (Docker Hub, GitHub Container Registry, a private registry) and then customizing it — installing packages inside it with <code>wwctl container exec</code>, much like building a Dockerfile interactively. The finished container becomes the exact root filesystem every compute node boots from. Warewulf publishes ready-made base containers (e.g. <code>ghcr.io/warewulf/warewulf-rockylinux:9</code>) so you rarely start truly from scratch.</p>
+
+<h3>Overlays (system vs. runtime)</h3>
+<p>A container image is the same for every node in a profile — but real nodes need per-node differences: hostname, IP address, SSH host keys, <code>/etc/hosts</code>, Slurm's <code>slurm.conf</code>. Warewulf solves this with <strong>overlays</strong> — small, templated sets of files layered on top of the container at boot time (and periodically refreshed):</p>
+<ul>
+<li><strong>System overlay:</strong> applied early in boot, before the node is fully up — things the node needs to actually boot and get network config (network interfaces, hostname, <code>/etc/passwd</code>).</li>
+<li><strong>Runtime overlay:</strong> applied after boot and can be re-pushed live to running nodes without a reboot — things like updated Slurm config, SSH keys, or monitoring agent config.</li>
+</ul>
+<p>Overlay files are Go templates rendered per-node from Warewulf's node database, so one template (e.g. <code>/etc/hosts.ww</code>) generates a correct, unique file for every single node automatically.</p>
+
+<h3>Node profiles</h3>
+<p>Rather than specifying every setting (container, kernel args, network config) on every single node, you define a <strong>profile</strong> — a template of defaults — and nodes inherit from it. A typical setup has a <code>default</code> profile plus maybe a <code>gpu-compute</code> profile with different kernel arguments or a different container. Adding a new node is then often just one line assigning it to a profile and giving it a MAC/IP.</p>
+
+<h3>PXE / iPXE boot flow</h3>
+<p>Mechanically it's the same DHCP → TFTP/PXE → boot pattern every provisioning tool uses under the hood (see the xCAT section for the general pattern), but Warewulf owns the whole chain itself via <code>wwctl configure</code>: it can run its own DHCP/TFTP services, or hand off to iPXE for a more capable, scriptable boot loader that fetches the kernel, initramfs, and container image over HTTP instead of the much slower legacy TFTP-only path.</p>
+
+<svg class="diagram" viewBox="0 0 900 400" xmlns="http://www.w3.org/2000/svg">
+  <text x="450" y="28" text-anchor="middle" fill="#e8edf4" font-size="16" font-weight="700">Warewulf Architecture — Head Node → Compute Nodes</text>
+
+  <rect x="40" y="55" width="240" height="180" rx="8" fill="#1a2437" stroke="#25324a"/>
+  <text x="160" y="77" text-anchor="middle" fill="#76b900" font-size="13" font-weight="700">Head Node</text>
+  <text x="160" y="98" text-anchor="middle" fill="#9fb0c3" font-size="11">warewulfd (wwctl)</text>
+  <text x="160" y="116" text-anchor="middle" fill="#9fb0c3" font-size="11">container store (OCI images)</text>
+  <text x="160" y="134" text-anchor="middle" fill="#9fb0c3" font-size="11">overlay templates (system/runtime)</text>
+  <text x="160" y="152" text-anchor="middle" fill="#9fb0c3" font-size="11">node DB (profiles, nodes)</text>
+  <text x="160" y="174" text-anchor="middle" fill="#4fc3f7" font-size="11">DHCP · TFTP · iPXE · HTTP</text>
+  <text x="160" y="196" text-anchor="middle" fill="#9fb0c3" font-size="10">wwctl configure --all</text>
+  <text x="160" y="214" text-anchor="middle" fill="#9fb0c3" font-size="10">wwctl overlay build</text>
+
+  <rect x="330" y="55" width="230" height="80" rx="8" fill="#141c2b" stroke="#25324a"/>
+  <text x="445" y="77" text-anchor="middle" fill="#e8edf4" font-size="12" font-weight="700">1. Build container image</text>
+  <text x="445" y="97" text-anchor="middle" fill="#9fb0c3" font-size="10">wwctl container import (OCI)</text>
+  <text x="445" y="115" text-anchor="middle" fill="#9fb0c3" font-size="10">wwctl container exec (customize)</text>
+
+  <rect x="330" y="150" width="230" height="80" rx="8" fill="#141c2b" stroke="#25324a"/>
+  <text x="445" y="172" text-anchor="middle" fill="#e8edf4" font-size="12" font-weight="700">2. Define node + profile</text>
+  <text x="445" y="192" text-anchor="middle" fill="#9fb0c3" font-size="10">wwctl profile add / set</text>
+  <text x="445" y="210" text-anchor="middle" fill="#9fb0c3" font-size="10">wwctl node add --container=...</text>
+
+  <rect x="330" y="245" width="230" height="90" rx="8" fill="#141c2b" stroke="#25324a"/>
+  <text x="445" y="267" text-anchor="middle" fill="#e8edf4" font-size="12" font-weight="700">3. DHCP + iPXE handoff</text>
+  <text x="445" y="287" text-anchor="middle" fill="#9fb0c3" font-size="10">node MAC recognized</text>
+  <text x="445" y="305" text-anchor="middle" fill="#9fb0c3" font-size="10">iPXE fetches kernel + container</text>
+  <text x="445" y="323" text-anchor="middle" fill="#9fb0c3" font-size="10">+ rendered overlays over HTTP</text>
+
+  <rect x="630" y="140" width="230" height="120" rx="8" fill="#1a2437" stroke="#25324a"/>
+  <text x="745" y="165" text-anchor="middle" fill="#76b900" font-size="13" font-weight="700">Compute Node</text>
+  <text x="745" y="188" text-anchor="middle" fill="#9fb0c3" font-size="11">stateless: boots to RAM</text>
+  <text x="745" y="206" text-anchor="middle" fill="#9fb0c3" font-size="11">system overlay applied early</text>
+  <text x="745" y="224" text-anchor="middle" fill="#9fb0c3" font-size="11">runtime overlay applied post-boot</text>
+  <text x="745" y="246" text-anchor="middle" fill="#4fc3f7" font-size="11">ready: joins Slurm cluster</text>
+
+  <path d="M280 145 L330 95" stroke="#4fc3f7" stroke-width="2" fill="none" marker-end="url(#arrow6)"/>
+  <path d="M280 155 L330 190" stroke="#4fc3f7" stroke-width="2" fill="none" marker-end="url(#arrow6)"/>
+  <path d="M280 175 L330 290" stroke="#4fc3f7" stroke-width="2" fill="none" marker-end="url(#arrow6)"/>
+  <path d="M560 290 L630 220" stroke="#4fc3f7" stroke-width="2" fill="none" marker-end="url(#arrow6)"/>
+  <path d="M560 95 Q600 95 630 170" stroke="#25324a" stroke-width="1.5" fill="none" stroke-dasharray="4,3"/>
+  <path d="M560 190 Q600 195 630 200" stroke="#25324a" stroke-width="1.5" fill="none" stroke-dasharray="4,3"/>
+
+  <defs>
+    <marker id="arrow6" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto">
+      <path d="M0,0 L8,4 L0,8 Z" fill="#4fc3f7"/>
+    </marker>
+  </defs>
+</svg>
+
+<h2>Step-by-step: building a cluster with Warewulf + OpenHPC</h2>
+<p>This walkthrough follows the shape of OpenHPC's own "Cluster Building Recipes" (published per OS release, e.g. Rocky Linux 9 + Warewulf + Slurm) and real <code>wwctl</code> syntax from the Warewulf 4 documentation. Adjust package/version numbers to whatever OpenHPC release you're targeting — the OpenHPC recipe PDFs pin exact versions per OS.</p>
+
+<div class="card">
+<h3>Step 1 — Install OpenHPC base + Warewulf on the head node</h3>
+<p>Start from a clean Rocky Linux/RHEL install on the head (management) node, add the OpenHPC repo, then pull in the OpenHPC base meta-package and the Warewulf integration package:</p>
+<pre><code># Enable the OpenHPC repo for your OS release (example: EL9)
+dnf -y install http://repos.openhpc.community/OpenHPC/3/EL_9/x86_64/ohpc-release-3-1.el9.x86_64.rpm
+
+# Base OpenHPC tools + Warewulf provisioning integration
+dnf -y install ohpc-base warewulf-ohpc hwloc-ohpc
+
+# Enable and start the Warewulf daemon
+systemctl enable --now warewulfd
+</code></pre>
+</div>
+
+<div class="card">
+<h3>Step 2 — Build a Warewulf container image with OpenHPC packages</h3>
+<p>Import a base OS container from an OCI registry, then exec into it to install OpenHPC packages, exactly like customizing a Dockerfile interactively:</p>
+<pre><code># Import an official Warewulf base container (Rocky 9)
+wwctl container import docker://ghcr.io/warewulf/warewulf-rockylinux:9 rocky-9 --syncuser
+
+# Exec into the container to add the OpenHPC repo + base packages
+wwctl container exec rocky-9 /bin/bash <<'EOF'
+dnf -y install http://repos.openhpc.community/OpenHPC/3/EL_9/x86_64/ohpc-release-3-1.el9.x86_64.rpm
+dnf -y install ohpc-base-compute chrony ohpc-slurm-client
+dnf -y update
+EOF
+
+# Rebuild the bootable image artifacts from the modified container
+wwctl container build rocky-9
+</code></pre>
+<div class="callout tip">
+<div class="label">Tip</div>
+<code>wwctl container exec</code> drops you into the container's chroot with its own package manager working normally — you're literally building the compute-node root filesystem by installing packages into it, no separate "image build" DSL to learn.
+</div>
+</div>
+
+<div class="card">
+<h3>Step 3 — Define node profiles and nodes</h3>
+<pre><code># Create/adjust a profile compute nodes will inherit from
+wwctl profile add compute
+wwctl profile set compute --container=rocky-9 --netdev=eth0
+
+# Add individual nodes, referencing the profile and container
+wwctl node add n0001 --profile=compute --ipaddr=10.1.1.101 --hwaddr=3c:ec:ef:...:01
+wwctl node add n0002 --profile=compute --ipaddr=10.1.1.102 --hwaddr=3c:ec:ef:...:02
+
+# Confirm what was registered
+wwctl node list
+</code></pre>
+</div>
+
+<div class="card">
+<h3>Step 4 — Configure network boot (DHCP / TFTP / iPXE)</h3>
+<pre><code># Generate and apply DHCP, TFTP, and iPXE configuration in one shot
+wwctl configure --all
+
+# Or configure services individually
+wwctl configure dhcp
+wwctl configure tftp
+
+# Push overlays so nodes have current per-node config baked in
+wwctl overlay build
+</code></pre>
+<p><code>wwctl configure --all</code> writes out DHCP reservations for every defined node's MAC, sets up the TFTP/iPXE boot chain, and restarts the relevant services — the Warewulf equivalent of xCAT's <code>makedhcp</code>/<code>makedns</code> step.</p>
+</div>
+
+<div class="card">
+<h3>Step 5 — Boot the compute nodes</h3>
+<p>Power on (or PXE-reboot) the compute nodes. With network boot as the first boot device in firmware/BIOS, each node will DHCP, fetch the iPXE chain, then pull the kernel, initramfs, and container image over HTTP and boot straight into it — no install step, no waiting on disk partitioning:</p>
+<pre><code># Watch nodes come up
+wwctl node status
+
+# Tail the head node's provisioning logs while nodes boot
+journalctl -u warewulfd -f
+</code></pre>
+</div>
+
+<div class="card">
+<h3>Step 6 — Install Slurm + OpenHPC dev toolchain</h3>
+<p>Slurm's controller runs on the head node; Slurm's client daemon is already baked into the compute container from Step 2. Add the controller-side packages and a compiler/MPI toolchain for users:</p>
+<pre><code># On the head node — Slurm controller + Munge auth
+dnf -y install ohpc-slurm-server
+systemctl enable --now munge
+systemctl enable --now slurmctld
+
+# Compiler + MPI stack (goes into the compute container, then rebuild it)
+wwctl container exec rocky-9 dnf -y install gnu14-compilers-ohpc
+wwctl container exec rocky-9 dnf -y install openmpi5-pmix-gnu14-ohpc
+wwctl container build rocky-9
+
+# Push the updated container + config out and restart compute-side services
+wwctl overlay build
+</code></pre>
+</div>
+
+<div class="card">
+<h3>Step 7 — Validate with a test MPI job</h3>
+<pre><code># As a regular (non-root) user, load the OpenHPC-provided module environment
+module load gnu14 openmpi5
+
+# Compile a simple MPI hello-world (OpenHPC ships one under /opt/ohpc/pub/examples)
+mpicc -O3 -o mpi_hello /opt/ohpc/pub/examples/mpi/hello.c
+
+# Submit it through Slurm across two nodes
+sbatch -N 2 --ntasks-per-node=4 --wrap="mpirun ./mpi_hello"
+
+# Check it landed and ran correctly
+squeue
+sacct -j &lt;jobid&gt; --format=JobID,NodeList,State,ExitCode
+</code></pre>
+<p>A clean run — job completes, exit code 0, output shows one greeting line per rank from both nodes — confirms Warewulf's provisioning, the network fabric, Munge authentication, and Slurm's scheduler are all correctly wired end to end.</p>
+</div>
+
+<h2>OpenHPC component stack — how the layers fit</h2>
+<svg class="diagram" viewBox="0 0 900 400" xmlns="http://www.w3.org/2000/svg">
+  <text x="450" y="28" text-anchor="middle" fill="#e8edf4" font-size="16" font-weight="700">OpenHPC Component Stack</text>
+
+  <rect x="150" y="55" width="600" height="46" rx="6" fill="#1a2437" stroke="#76b900"/>
+  <text x="450" y="83" text-anchor="middle" fill="#e8edf4" font-size="12" font-weight="700">Applications &amp; user jobs (MPI codes, ML, simulations)</text>
+
+  <rect x="150" y="110" width="600" height="46" rx="6" fill="#141c2b" stroke="#25324a"/>
+  <text x="450" y="138" text-anchor="middle" fill="#9fb0c3" font-size="11">Dev toolchain: gnu14-compilers-ohpc · llvm · openmpi5 / mpich / mvapich2 · EasyBuild · Spack</text>
+
+  <rect x="150" y="165" width="600" height="46" rx="6" fill="#141c2b" stroke="#25324a"/>
+  <text x="450" y="193" text-anchor="middle" fill="#9fb0c3" font-size="11">Performance &amp; libs: hwloc-ohpc · perf-tools · lmod modules environment</text>
+
+  <rect x="150" y="220" width="600" height="46" rx="6" fill="#141c2b" stroke="#25324a"/>
+  <text x="450" y="248" text-anchor="middle" fill="#4fc3f7" font-size="11">Resource manager: ohpc-slurm-server / ohpc-slurm-client · Munge auth</text>
+
+  <rect x="150" y="275" width="600" height="46" rx="6" fill="#141c2b" stroke="#25324a"/>
+  <text x="450" y="303" text-anchor="middle" fill="#4fc3f7" font-size="11">Provisioning integration: warewulf-ohpc recipes (or xCAT recipes)</text>
+
+  <rect x="150" y="330" width="600" height="46" rx="6" fill="#1a2437" stroke="#25324a"/>
+  <text x="450" y="358" text-anchor="middle" fill="#e8edf4" font-size="11">Base OS: Rocky Linux / RHEL / OpenSUSE Leap (ohpc-release repo)</text>
+</svg>
+
+<h2>Pros / cons vs. BCM and xCAT</h2>
+<table>
+<tr><th>Tool</th><th>Model</th><th>Strengths</th><th>Trade-offs</th></tr>
+<tr><td>Warewulf + OpenHPC</td><td>Free, open-source, OCI-container image based</td><td>Simple mental model (containers + overlays), modern workflow, OpenHPC gives version-tested package recipes, zero license cost, active upstream (hpcng/Warewulf, openhpc.community)</td><td>Smaller ecosystem than xCAT for exotic hardware/console management at extreme scale; you own all integration and support yourself</td></tr>
+<tr><td>xCAT</td><td>Free, open-source, CLI/DB-driven</td><td>Extremely mature, flexible, scales to very large/hierarchical clusters</td><td>Steeper learning curve, less modern image workflow, community support only</td></tr>
+<tr><td>BCM (Bright)</td><td>Commercial, GUI + CLI</td><td>Turnkey experience, vendor support, integrated monitoring out of the box</td><td>License cost, less transparent internals, vendor lock-in</td></tr>
+</table>
+<div class="callout warn">
+<div class="label">Watch out</div>
+Warewulf's stateless-by-default model means anything written outside the container/overlay system (e.g. an admin manually installing a package on a running node with <code>dnf install</code>) vanishes on next reboot. This is a feature for consistency, but it catches newcomers who expect a normal persistent Linux box — always make changes in the container and rebuild.
+</div>
+<div class="callout tip">
+<div class="label">Why this matters</div>
+This is the most "open-source native" and cost-free path in this entire guide: no license, no vendor account, and the exact commands here are traceable back to public Warewulf and OpenHPC documentation. It's an excellent choice for labs, universities, and any team that wants to fully own and understand their provisioning stack.
+</div>
+
+<h2>Further Reading</h2>
+<ul>
+<li><a href="https://warewulf.org/docs/main/">Warewulf 4 User Guide (main documentation)</a></li>
+<li><a href="https://warewulf.org/docs/main/release/v4.6.4.html">Warewulf v4.6.4 Release Notes</a></li>
+<li><a href="https://github.com/warewulf/warewulf">warewulf/warewulf on GitHub</a></li>
+<li><a href="https://openhpc.community/">OpenHPC Community — openhpc.community</a></li>
+<li><a href="https://lists.openhpc.community/g/users/attachment/5442/0/Install_guide.pdf">OpenHPC (v3.2) Cluster Building Recipes — Rocky 9 Base OS, Warewulf/Slurm Edition (PDF)</a></li>
+<li><a href="https://dokuwiki.wesleyan.edu/lib/exe/fetch.php?media=cluster:install_guide-rocky8-warewulf-slurm-2.4-x86_64.pdf">OpenHPC (v2.4) Cluster Building Recipes — Rocky 8.5 Base OS (PDF)</a></li>
+<li><a href="https://docs.marwan.ma/tech/ohpc.html">MARWAN docs — OpenHPC Installation Guide walkthrough (via recipe.sh)</a></li>
+<li><a href="https://github.com/stanfordhpccenter/OpenHPC/blob/main/hpc-for-the-rest-of-us/recipes/rocky8/warewulf4/slurm/recipe.sh">Stanford HPC Center — example Warewulf4 + Slurm recipe.sh</a></li>
+<li><a href="https://ciq.com/blog/openhpc-on-rocky-linux-painless-hpc-cluster-management">CIQ — OpenHPC on Rocky Linux: painless HPC cluster management</a></li>
+<li><a href="https://thenewstack.io/get-to-know-warewulf-4/">The New Stack — Get to Know Warewulf 4</a></li>
+</ul>
+
+<div class="section-nav"><a href="05-provisioning-xcat.html">← Provisioning with xCAT</a><a href="07-provisioning-baremetal-ansible.html">Next: Bare-metal with Ansible →</a></div>
+</main></div>
+<footer><div class="wrap">Part of the HPC Cluster Build Guide.</div></footer>
+</body>
+</html>

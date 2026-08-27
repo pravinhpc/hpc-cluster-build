@@ -1,0 +1,202 @@
+<!DOCTYPE html>
+<html data-theme="dark" lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>17 — CSP Build: Microsoft Azure | HPC Cluster Build Guide</title>
+<link rel="stylesheet" href="../assets/css/style.css">
+</head>
+<body>
+<header class="top"><div class="wrap"><a href="../index.html">HPC Cluster Build Guide</a><span class="badge">Public Edition</span></div></header>
+<div class="wrap"><nav class="crumbs"><a href="16-csp-gcp.html">← CSP Build — GCP</a></nav>
+<main>
+
+<h1>17 — CSP Build: Microsoft Azure</h1>
+<p class="lede">Everything earlier in this guide assumed you own the racks. On Azure, the physical layer — servers, InfiniBand fabric, power, cooling — is Microsoft's problem, and yours becomes VM sizing, fabric-aware placement, and orchestration software that turns a pool of virtual machines into a working Slurm or PBS cluster. This section covers the GPU VM families relevant to HPC/AI, Azure's InfiniBand story, and Azure CycleCloud — the tool most Azure-native GPU clusters are actually built with.</p>
+
+<h2>The GPU VM families that matter</h2>
+<p>Azure's HPC/AI compute lives in the <strong>ND-series</strong> (network-optimized, GPU-heavy, InfiniBand-attached). Three generations show up most often in current builds:</p>
+<table>
+<tr><th>VM size</th><th>GPU</th><th>Per-GPU fabric</th><th>Notes</th></tr>
+<tr><td>ND H100 v5</td><td>8× NVIDIA H100 80GB</td><td>400 Gbps NVIDIA Quantum-2 CX7 InfiniBand (dedicated NIC per GPU)</td><td>Current flagship training SKU; NVLink 4.0 intra-node</td></tr>
+<tr><td>NDm A100 v4</td><td>8× NVIDIA A100 80GB</td><td>200 Gbps HDR InfiniBand (dedicated NIC per GPU)</td><td>Previous-generation, still widely deployed; NVLink 3.0 intra-node</td></tr>
+<tr><td>ND MI300X v5</td><td>8× AMD Instinct MI300X</td><td>InfiniBand-attached, AMD Infinity Fabric intra-node</td><td>AMD alternative for teams standardizing on ROCm</td></tr>
+</table>
+<p>The pattern across all three: every GPU gets its own dedicated, topology-agnostic RDMA NIC rather than the GPUs sharing a handful of NICs, which is what lets multi-node NCCL/RCCL collectives scale close to linearly as node count grows.</p>
+
+<h2>InfiniBand on Azure</h2>
+<p>These VM sizes are deployed on an NDR/HDR InfiniBand fabric built and operated by Microsoft — you don't touch switches or cabling. What you're responsible for as the cluster builder is placement and drivers:</p>
+<ul>
+  <li><strong>Placement groups / proximity</strong> — CycleCloud and the underlying scale set logic place nodes so their IB NICs land on the same non-blocking fabric segment; requesting nodes outside a single scale-set deployment can silently degrade to worse topology.</li>
+  <li><strong>Driver stack</strong> — the InfiniBand NIC needs a matching OFED/driver version inside the VM image; Azure's HPC-flavored marketplace images (AlmaLinux-HPC, Ubuntu-HPC) ship this pre-tuned, which is why most CycleCloud templates start from one of them rather than a stock OS image.</li>
+  <li><strong>SR-IOV passthrough</strong> — the IB NIC is exposed to the guest via SR-IOV, so MPI/NCCL inside the VM talk to it almost as directly as on bare metal.</li>
+</ul>
+
+<h2>Azure CycleCloud — the primary build tool</h2>
+<p>Azure CycleCloud is Microsoft's cluster orchestration product for HPC/AI on Azure. It's the rough equivalent of what BCM does on-prem (guide 04), but built around dynamic autoscale of cloud VMs rather than a fixed fleet of physical nodes:</p>
+<ul>
+  <li><strong>Cluster templates</strong> define one or more <em>nodearrays</em> (e.g. a GPU compute array, a login/scheduler array), each mapped to a VM size, image, and network configuration.</li>
+  <li><strong>Autoscale</strong> — nodearrays scale from zero; CycleCloud watches the scheduler's queue (Slurm, PBS, LSF, Grid Engine, HTCondor are all supported) and spins up or tears down VMs to match demand.</li>
+  <li><strong>Scheduler integration</strong> is built in — the default Slurm template ships with three partitions (<code>hpc</code>, <code>htc</code>, <code>dynamic</code>) and pre-wires PMIx, Pyxis, and enroot so containerized AI jobs work out of the box.</li>
+</ul>
+
+<h2>Diagram: Azure GPU cluster architecture</h2>
+<svg class="diagram" viewBox="0 0 900 400" xmlns="http://www.w3.org/2000/svg">
+  <style>
+    .lbl{font-family:sans-serif;font-size:13px;fill:#e8edf4}
+    .lbl2{font-family:sans-serif;font-size:11px;fill:#9fb0c3}
+    .box{fill:#1a2437;stroke:#25324a;stroke-width:1.5}
+    .accent{fill:#141c2b;stroke:#76b900;stroke-width:2}
+    .vnet{fill:none;stroke:#3a4a68;stroke-width:1.5;stroke-dasharray:6,4}
+    .arrow{stroke:#76b900;stroke-width:2;fill:none;marker-end:url(#arrow2)}
+    .arrow-ib{stroke:#4f8fd1;stroke-width:2;fill:none;marker-end:url(#arrow-ib)}
+  </style>
+  <defs>
+    <marker id="arrow2" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#76b900"/>
+    </marker>
+    <marker id="arrow-ib" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#4f8fd1"/>
+    </marker>
+  </defs>
+  <rect x="10" y="10" width="880" height="380" fill="#0d1420" stroke="#25324a"/>
+
+  <rect x="40" y="40" width="150" height="50" rx="8" class="accent"/>
+  <text x="115" y="61" text-anchor="middle" class="lbl" font-weight="bold">CycleCloud</text>
+  <text x="115" y="78" text-anchor="middle" class="lbl2">orchestrates from outside VNet</text>
+
+  <rect x="230" y="40" width="620" height="330" rx="10" class="vnet"/>
+  <text x="250" y="60" class="lbl2">VNet</text>
+
+  <rect x="260" y="90" width="160" height="60" rx="6" class="box"/>
+  <text x="340" y="113" text-anchor="middle" class="lbl">Login / Scheduler</text>
+  <text x="340" y="130" text-anchor="middle" class="lbl2">nodearray "login"</text>
+
+  <rect x="470" y="90" width="160" height="60" rx="6" class="box"/>
+  <text x="550" y="113" text-anchor="middle" class="lbl">Slurm Controller</text>
+  <text x="550" y="130" text-anchor="middle" class="lbl2">autoscale + partitions</text>
+
+  <rect x="680" y="90" width="140" height="60" rx="6" class="box"/>
+  <text x="750" y="113" text-anchor="middle" class="lbl2">NSG / Subnet</text>
+  <text x="750" y="130" text-anchor="middle" class="lbl2">compute-scoped rules</text>
+
+  <rect x="260" y="200" width="130" height="55" rx="6" class="accent"/>
+  <text x="325" y="221" text-anchor="middle" class="lbl2">ND H100 v5</text>
+  <text x="325" y="237" text-anchor="middle" class="lbl2">GPU node 0</text>
+
+  <rect x="410" y="200" width="130" height="55" rx="6" class="accent"/>
+  <text x="475" y="221" text-anchor="middle" class="lbl2">ND H100 v5</text>
+  <text x="475" y="237" text-anchor="middle" class="lbl2">GPU node 1</text>
+
+  <rect x="560" y="200" width="130" height="55" rx="6" class="accent"/>
+  <text x="625" y="221" text-anchor="middle" class="lbl2">ND H100 v5</text>
+  <text x="625" y="237" text-anchor="middle" class="lbl2">GPU node N</text>
+
+  <text x="475" y="285" text-anchor="middle" class="lbl2">Quantum-2 CX7 InfiniBand fabric (dedicated NIC/GPU, SR-IOV)</text>
+  <line x1="325" y1="255" x2="325" y2="270" class="arrow-ib"/>
+  <line x1="475" y1="255" x2="475" y2="270" class="arrow-ib"/>
+  <line x1="625" y1="255" x2="625" y2="270" class="arrow-ib"/>
+  <line x1="270" y1="270" x2="680" y2="270" class="arrow-ib" marker-end="none"/>
+
+  <rect x="260" y="320" width="220" height="55" rx="6" class="box"/>
+  <text x="370" y="341" text-anchor="middle" class="lbl2">Azure NetApp Files</text>
+  <text x="370" y="357" text-anchor="middle" class="lbl2">NFS home / general storage</text>
+
+  <rect x="500" y="320" width="220" height="55" rx="6" class="box"/>
+  <text x="610" y="341" text-anchor="middle" class="lbl2">Azure Managed Lustre</text>
+  <text x="610" y="357" text-anchor="middle" class="lbl2">training-data / checkpoint I/O</text>
+
+  <line x1="190" y1="65" x2="255" y2="65" class="arrow"/>
+  <line x1="115" y1="90" x2="115" y2="120" class="arrow" marker-end="url(#arrow2)"/>
+  <line x1="115" y1="120" x2="255" y2="120" class="arrow"/>
+  <line x1="340" y1="150" x2="340" y2="195" class="arrow"/>
+  <line x1="550" y1="150" x2="475" y2="195" class="arrow"/>
+  <line x1="325" y1="255" x2="325" y2="315" class="arrow" marker-end="none"/>
+  <line x1="370" y1="290" x2="370" y2="315" class="arrow"/>
+  <line x1="610" y1="290" x2="610" y2="315" class="arrow"/>
+</svg>
+
+<h2>Step-by-step: building a Slurm cluster with CycleCloud</h2>
+
+<div class="card">
+<h3>Step 1 — Deploy the CycleCloud server</h3>
+<p>CycleCloud itself runs as a management VM (deployable from the Azure Marketplace or the CycleCloud Workspace for Slurm solution template) inside a VNet. It needs an Azure AD / Entra application registration and a managed identity with permission to create and delete VMs, disks, and NICs in the target subscription — this is what lets it actually scale the cluster.</p>
+</div>
+
+<div class="card">
+<h3>Step 2 — Define the cluster template</h3>
+<p>A cluster template describes the nodearrays, VM sizes, image, and network placement. A minimal GPU Slurm template looks like this:</p>
+<pre><code>[cluster azure-gpu-slurm]
+FormLayout = selectionpanel
+Category = Schedulers
+
+[[node defaults]]
+Credentials = azure-subscription
+SubnetId = $SubnetId
+Region = $Region
+
+[[nodearray hpc]]
+MachineType = Standard_ND96isr_H100_v5
+ImageName = microsoft-dsvm:ubuntu-hpc:2204:latest
+MaxCoreCount = 768
+Interruptible = false
+
+  [[[configuration]]]
+  slurm.autoscale = true
+  slurm.partition = hpc
+
+  [[[network-interface eth0]]]
+  AssociatePublicIpAddress = false
+
+  [[[cluster-init cyclecloud/slurm:execute]]]
+
+[[nodearray login]]
+MachineType = Standard_D8s_v5
+MaxCoreCount = 8
+
+  [[[cluster-init cyclecloud/slurm:scheduler]]]
+</code></pre>
+</div>
+
+<div class="card">
+<h3>Step 3 — Wire up the VNet and storage</h3>
+<p>Nodearrays reference a subnet inside a VNet you (or the Workspace solution template) provision ahead of time, typically with a dedicated subnet for compute so NSG rules and IB placement can be scoped tightly. Shared storage — Azure NetApp Files or Azure Managed Lustre — is mounted at boot time via the same <code>cluster-init</code> scripts that set up Slurm.</p>
+</div>
+
+<div class="card">
+<h3>Step 4 — Import and start the cluster</h3>
+<p>The template is imported into CycleCloud (via the web UI or the <code>cyclecloud</code> CLI), started, and the scheduler nodearray boots first, followed by GPU nodes as jobs are submitted — CycleCloud provisions VMs on demand rather than holding them all warm.</p>
+</div>
+
+<h2>Alternative paths: Azure Batch and AKS</h2>
+<p>CycleCloud isn't the only way to run GPU workloads on Azure:</p>
+<ul>
+  <li><strong>Azure Batch</strong> — a managed job-scheduling service for embarrassingly parallel or batch workloads; good fit if you don't need a persistent Slurm-style cluster and just want to submit jobs against an autoscaling pool.</li>
+  <li><strong>AKS (Azure Kubernetes Service)</strong> — GPU node pools on ND-series VMs, useful when the workload is already containerized and orchestrated as Kubernetes jobs rather than HPC scheduler jobs; InfiniBand support requires the same SR-IOV-aware images and device plugins as a VM-based cluster.</li>
+</ul>
+<p>Most training-focused HPC/AI clusters still land on CycleCloud + Slurm because that's the path with the most mature InfiniBand-aware autoscale and topology placement; Batch and AKS are better fits when the workload model is already batch-job or Kubernetes-native.</p>
+
+<h2>Storage: NetApp Files vs. Managed Lustre</h2>
+<table>
+<tr><th></th><th>Azure NetApp Files</th><th>Azure Managed Lustre</th></tr>
+<tr><td>Protocol</td><td>NFS / SMB / dual-protocol</td><td>Lustre</td></tr>
+<tr><td>Scale</td><td>Up to ~4,000 cores, ~12.8 GiB/s throughput</td><td>50,000+ cores, up to 500 Gbps throughput, up to 2.5 PiB</td></tr>
+<tr><td>Best fit</td><td>General enterprise file storage, mixed NFS/SMB access</td><td>HPC/AI checkpoint and training-data I/O patterns</td></tr>
+</table>
+
+<h2>Further Reading</h2>
+<ul>
+  <li><a href="https://learn.microsoft.com/en-us/azure/virtual-machines/sizes/gpu-accelerated/ndh100v5-series" target="_blank" rel="noopener">Microsoft Learn — ND H100 v5 size series</a></li>
+  <li><a href="https://learn.microsoft.com/en-us/azure/virtual-machines/sizes/gpu-accelerated/ndma100v4-series" target="_blank" rel="noopener">Microsoft Learn — NDm A100 v4 size series</a></li>
+  <li><a href="https://learn.microsoft.com/en-us/azure/cyclecloud/slurm?view=cyclecloud-8" target="_blank" rel="noopener">Microsoft Learn — Azure CycleCloud Slurm Scheduler Integration</a></li>
+  <li><a href="https://github.com/Azure/cyclecloud-slurm-workspace" target="_blank" rel="noopener">GitHub — Azure CycleCloud Workspace for Slurm</a></li>
+  <li><a href="https://learn.microsoft.com/en-us/azure/azure-managed-lustre/amlfs-overview" target="_blank" rel="noopener">Microsoft Learn — What is Azure Managed Lustre?</a></li>
+  <li><a href="https://azure.microsoft.com/en-us/products/managed-lustre" target="_blank" rel="noopener">Azure Managed Lustre — Product Page</a></li>
+</ul>
+
+<div class="section-nav"><a href="16-csp-gcp.html">← CSP Build — GCP</a><a href="18-csp-oci.html">Next: CSP Build — OCI →</a></div>
+</main>
+</div>
+<footer><div class="wrap">Part of the HPC Cluster Build Guide.</div></footer>
+</body>
+</html>

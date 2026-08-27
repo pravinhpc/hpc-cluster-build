@@ -1,0 +1,280 @@
+<!DOCTYPE html>
+<html data-theme="dark" lang="en">
+<head>
+<meta charset="UTF-8">
+<title>05 — Cluster Provisioning with xCAT | HPC Cluster Build Guide</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="../assets/css/style.css">
+</head>
+<body>
+<header class="top"><div class="wrap"><a href="../index.html">HPC Cluster Build Guide</a><span class="badge">Public Edition</span></div></header>
+<div class="wrap"><nav class="crumbs"><a href="04-provisioning-bcm.html">← Provisioning with BCM</a></nav>
+<main>
+
+<h1>05 — Cluster Provisioning with xCAT</h1>
+<p class="lede">xCAT (Extreme Cloud Administration Toolkit) is the grandparent of open-source cluster provisioning. Before Warewulf, before Bright Cluster Manager, xCAT was already turning racks of bare metal into working clusters — and it's still doing that job today, on everything from small university clusters to some of the largest supercomputers on the planet.</p>
+
+<h2>What is xCAT, really?</h2>
+<p>xCAT started life inside IBM in the early 2000s as an internal tool for deploying large Linux clusters, and IBM later open-sourced it. It's now community-maintained on GitHub (<code>xcat2/xcat-core</code>) and is free to use — no license fee, no vendor lock-in. Think of it as a toolbox of Perl-based commands, a database of "what every node should look like," and a set of network services (DHCP, TFTP, DNS) glued together so that powering on a bare-metal server results in a fully configured, cluster-ready node with zero manual OS installs.</p>
+<p>Where BCM (covered in the previous section) is a polished, commercially-supported product with a GUI and a single vendor behind it, xCAT is the opposite philosophy: command-line first, fully scriptable, free, and community-driven. It's popular in HPC shops — including several IBM Power/GPU systems and many university and national-lab clusters — precisely because it doesn't hide anything behind a UI. Everything xCAT does, you can also do by hand by reading its database tables and scripts.</p>
+
+<div class="callout tip">
+<div class="label">Why this matters</div>
+Once you understand xCAT, you understand the <em>mechanics</em> that every other provisioning tool (BCM, Warewulf, Foreman, MAAS) is really automating under the hood: DHCP hands out an IP, PXE loads a boot image over TFTP, and an installer or a diskless image turns that bare machine into a named, configured cluster node. xCAT just makes those mechanics explicit.
+</div>
+
+<h2>Core concepts</h2>
+
+<h3>The management node</h3>
+<p>Every xCAT cluster has one (or a hierarchy of) <strong>management node(s)</strong> — the server that runs the xCAT daemon (<code>xcatd</code>), hosts the database, and provides DHCP/TFTP/HTTP/DNS services to the rest of the cluster. On larger clusters, xCAT supports a hierarchical setup with <strong>service nodes</strong> that offload provisioning traffic for a rack or a pod, so the single management node doesn't become a bottleneck when 500 nodes PXE-boot at once.</p>
+
+<h3>Node objects and database tables</h3>
+<p>xCAT stores cluster state in a relational database (SQLite by default, or PostgreSQL/MySQL for larger sites) organized into <strong>tables</strong>. You rarely edit these tables directly — you use commands like <code>mkdef</code>, <code>chdef</code>, and <code>lsdef</code> — but it helps to know the key ones:</p>
+<table>
+<tr><th>Table</th><th>Purpose</th></tr>
+<tr><td><code>nodelist</code></td><td>Master list of node names, groups, and status — the root of "does this node exist."</td></tr>
+<tr><td><code>nodetype</code></td><td>What OS/architecture/provisioning method (<code>os</code>, <code>arch</code>, <code>profile</code>, <code>provmethod</code>) each node uses.</td></tr>
+<tr><td><code>nodehm</code></td><td>Hardware management settings — power control method, console method (<code>mgt</code>, <code>cons</code>).</td></tr>
+<tr><td><code>mac</code></td><td>MAC address to node name mapping, used by DHCP.</td></tr>
+<tr><td><code>chain</code></td><td>The post-boot "chain of custody" — what happens right after install (run a postscript, boot to disk, run another script, etc).</td></tr>
+<tr><td><code>postscripts</code></td><td>Which postscripts run on which nodes/groups after OS deployment.</td></tr>
+</table>
+<p>A node in xCAT is a formal <strong>object</strong> — you can inspect it in full with <code>lsdef</code>, exactly like <code>kubectl describe</code> for a Kubernetes pod. This object model is what makes xCAT scriptable: everything is text in, text out.</p>
+
+<h3>Stateful vs. stateless (diskless) provisioning</h3>
+<p>xCAT supports both major provisioning models, and picking between them is one of the first design decisions on any build:</p>
+<ul>
+<li><strong>Stateful (diskful):</strong> a normal OS install to local disk, done via a scripted installer — Anaconda kickstart for RHEL/Rocky/CentOS, or AutoYaST for SUSE. The node reboots into a persistent local OS, just like installing Linux on a laptop. Changes persist across reboots.</li>
+<li><strong>Stateless (diskless):</strong> the entire root filesystem is built once on the management node into an <strong>image</strong>, compressed, and shipped to compute nodes at every boot. The node loads it into RAM (via <code>tmpfs</code>/ramdisk, optionally with a small persistent "statelite" overlay for a handful of directories) and runs from memory. Nothing is written to local disk, so every reboot returns the node to an identical, known-good state — extremely useful for large HPC fleets where node drift is the enemy.</li>
+</ul>
+<div class="callout tip">
+<div class="label">Rule of thumb</div>
+Stateless is popular on large GPU/HPC compute fleets because it eliminates configuration drift and makes node replacement trivial — just PXE boot a spare node with the same image. Stateful is often kept for management nodes, login nodes, or storage nodes that need real persistent local state.
+</div>
+
+<h3>osimage — the deployment blueprint</h3>
+<p>An <strong>osimage</strong> is an xCAT object that ties together everything needed to deploy a node: the OS distribution, architecture, provisioning method (<code>install</code>, <code>netboot</code>, <code>statelite</code>), the kickstart/autoyast template, the package list, and (for diskless) the path to the built root image. You typically start from a sample osimage created by <code>copycds</code> when you import an ISO, then clone and customize it.</p>
+
+<h3>The PXE/DHCP/TFTP flow</h3>
+<p>This is the plumbing that makes "power on and it installs itself" possible:</p>
+<ol>
+<li>Compute node powers on, NIC issues a <strong>DHCP</strong> request on the network xCAT manages.</li>
+<li>xCAT's DHCP service (configured via <code>makedhcp</code>) recognizes the node's MAC address (from the <code>mac</code> table) and hands back an IP plus the location of a <strong>PXE/TFTP</strong> bootloader.</li>
+<li>The node's NIC firmware fetches that bootloader over <strong>TFTP</strong> and loads a boot kernel + initrd — for stateful installs this launches the OS installer; for stateless it mounts and boots the packed root image over HTTP/NFS.</li>
+<li>xCAT's <strong>DNS</strong> service (via <code>makedns</code>) and hosts table keep hostname resolution consistent across the cluster as nodes come online.</li>
+<li>Once installed (or netbooted), <strong>postscripts</strong> run to apply final configuration — join Slurm, set up SSH keys, configure NTP, etc.</li>
+</ol>
+
+<svg class="diagram" viewBox="0 0 900 400" xmlns="http://www.w3.org/2000/svg">
+  <text x="450" y="28" text-anchor="middle" fill="#e8edf4" font-size="16" font-weight="700">xCAT Architecture — Management Node → Compute Nodes</text>
+
+  <rect x="40" y="60" width="230" height="160" rx="8" fill="#1a2437" stroke="#25324a"/>
+  <text x="155" y="82" text-anchor="middle" fill="#76b900" font-size="13" font-weight="700">Management Node</text>
+  <text x="155" y="104" text-anchor="middle" fill="#9fb0c3" font-size="11">xcatd daemon</text>
+  <text x="155" y="122" text-anchor="middle" fill="#9fb0c3" font-size="11">DB: nodelist / nodetype /</text>
+  <text x="155" y="136" text-anchor="middle" fill="#9fb0c3" font-size="11">mac / chain / postscripts</text>
+  <text x="155" y="158" text-anchor="middle" fill="#4fc3f7" font-size="11">DHCP · TFTP · HTTP</text>
+  <text x="155" y="176" text-anchor="middle" fill="#4fc3f7" font-size="11">DNS · osimage store</text>
+  <text x="155" y="198" text-anchor="middle" fill="#9fb0c3" font-size="10">(makedhcp / makedns)</text>
+
+  <rect x="330" y="60" width="220" height="90" rx="8" fill="#141c2b" stroke="#25324a"/>
+  <text x="440" y="82" text-anchor="middle" fill="#e8edf4" font-size="12" font-weight="700">1. DHCP request (PXE)</text>
+  <text x="440" y="102" text-anchor="middle" fill="#9fb0c3" font-size="10">NIC broadcasts on boot</text>
+  <text x="440" y="120" text-anchor="middle" fill="#9fb0c3" font-size="10">MAC looked up in mac table</text>
+  <text x="440" y="138" text-anchor="middle" fill="#9fb0c3" font-size="10">→ IP + bootloader location</text>
+
+  <rect x="330" y="170" width="220" height="90" rx="8" fill="#141c2b" stroke="#25324a"/>
+  <text x="440" y="192" text-anchor="middle" fill="#e8edf4" font-size="12" font-weight="700">2. TFTP boot fetch</text>
+  <text x="440" y="212" text-anchor="middle" fill="#9fb0c3" font-size="10">kernel + initrd pulled</text>
+  <text x="440" y="230" text-anchor="middle" fill="#9fb0c3" font-size="10">install script or netboot</text>
+  <text x="440" y="248" text-anchor="middle" fill="#9fb0c3" font-size="10">image mounted from osimage</text>
+
+  <rect x="330" y="280" width="220" height="90" rx="8" fill="#141c2b" stroke="#25324a"/>
+  <text x="440" y="302" text-anchor="middle" fill="#e8edf4" font-size="12" font-weight="700">3. Postscripts run</text>
+  <text x="440" y="322" text-anchor="middle" fill="#9fb0c3" font-size="10">hostname, SSH keys, NTP,</text>
+  <text x="440" y="340" text-anchor="middle" fill="#9fb0c3" font-size="10">Slurm join, monitoring agent</text>
+
+  <rect x="630" y="140" width="220" height="120" rx="8" fill="#1a2437" stroke="#25324a"/>
+  <text x="740" y="165" text-anchor="middle" fill="#76b900" font-size="13" font-weight="700">Compute Node</text>
+  <text x="740" y="188" text-anchor="middle" fill="#9fb0c3" font-size="11">PXE-enabled NIC</text>
+  <text x="740" y="206" text-anchor="middle" fill="#9fb0c3" font-size="11">boots stateful (disk) or</text>
+  <text x="740" y="222" text-anchor="middle" fill="#9fb0c3" font-size="11">stateless (RAM image)</text>
+  <text x="740" y="244" text-anchor="middle" fill="#4fc3f7" font-size="11">ready: joins Slurm cluster</text>
+
+  <path d="M270 105 L330 105" stroke="#4fc3f7" stroke-width="2" marker-end="url(#arrow5)"/>
+  <path d="M550 105 Q590 105 590 215 L550 215" stroke="#4fc3f7" stroke-width="2" fill="none" marker-end="url(#arrow5)"/>
+  <path d="M550 325 L590 325 Q610 325 610 260 L610 260" stroke="#4fc3f7" stroke-width="2" fill="none"/>
+  <path d="M270 130 Q300 250 330 325" stroke="#25324a" stroke-width="1.5" fill="none" stroke-dasharray="4,3"/>
+  <path d="M550 215 L630 200" stroke="#4fc3f7" stroke-width="2" marker-end="url(#arrow5)"/>
+  <path d="M630 220 L550 320" stroke="#25324a" stroke-width="1.5" fill="none" stroke-dasharray="4,3"/>
+
+  <defs>
+    <marker id="arrow5" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto">
+      <path d="M0,0 L8,4 L0,8 Z" fill="#4fc3f7"/>
+    </marker>
+  </defs>
+</svg>
+
+<h2>Step-by-step: building a cluster with xCAT</h2>
+
+<div class="card">
+<h3>Step 1 — Install xCAT on the management node</h3>
+<p>xCAT ships as RPM/deb repositories for RHEL/Rocky, SLES, and Ubuntu. On a RHEL-family management node:</p>
+<pre><code>wget https://xcat.org/files/xcat/repos/yum/latest/xcat-core/xcat-core.repo -P /etc/yum.repos.d/
+wget https://xcat.org/files/xcat/repos/yum/xcat-dep/rh8/x86_64/xcat-dep.repo -P /etc/yum.repos.d/
+yum install xCAT
+
+source /etc/profile.d/xcat.sh   # loads xCAT commands into PATH
+xcatconfig -c                    # initial configuration
+</code></pre>
+<p>This installs the xCAT daemon, the default SQLite database, and the full command suite (<code>nodels</code>, <code>lsdef</code>, <code>mkdef</code>, <code>nodeset</code>, <code>rpower</code>, and friends).</p>
+</div>
+
+<div class="card">
+<h3>Step 2 — Define your nodes</h3>
+<p>Nodes can be defined individually with <code>mkdef</code>, or bulk-added from a CSV/range with <code>nodeadd</code>. A typical single-node definition, giving xCAT everything it needs for hardware management, network boot, and provisioning:</p>
+<pre><code># Define one compute node
+mkdef -t node cn01 groups=compute,all \
+  arch=x86_64 \
+  mgt=ipmi bmc=10.4.14.51 bmcusername=ADMIN bmcpassword=admin \
+  mac=6C:AE:8B:1B:E8:52 \
+  netboot=xnba \
+  ip=10.1.1.51 interface=eth0 \
+  provmethod=rocky9.3-x86_64-install-compute
+
+# Or bulk-add a range of nodes from a stanza/definition file
+nodeadd cn[01-64] groups=compute,all
+
+# Inspect what you just created
+lsdef cn01
+nodels compute
+</code></pre>
+<div class="callout tip">
+<div class="label">Tip</div>
+<code>groups=compute,all</code> matters — most later commands (<code>nodeset</code>, <code>rpower</code>, <code>xdsh</code>) can target a whole group at once instead of naming every node.
+</div>
+</div>
+
+<div class="card">
+<h3>Step 3 — Create and customize an osimage</h3>
+<p>Import an OS ISO to auto-generate baseline osimage definitions, then clone and tailor one for your compute nodes:</p>
+<pre><code># Import ISO media, generates sample osimage defs automatically
+copycds /path/to/Rocky-9.3-x86_64-dvd.iso
+
+# List what got created
+lsdef -t osimage
+
+# Inspect and customize the install-based (stateful) image
+lsdef -t osimage rocky9.3-x86_64-install-compute
+chdef -t osimage rocky9.3-x86_64-install-compute \
+  pkglist=/opt/xcat/share/xcat/install/rh/compute.rocky9.pkglist
+
+# For a stateless (diskless) image instead:
+lsdef -t osimage rocky9.3-x86_64-netboot-compute
+genimage rocky9.3-x86_64-netboot-compute       # builds the root image
+packimage rocky9.3-x86_64-netboot-compute      # compresses it for netboot
+</code></pre>
+</div>
+
+<div class="card">
+<h3>Step 4 — Set up DHCP, TFTP, and DNS</h3>
+<pre><code># Generate DHCP config for the management network and restart the service
+makedhcp -n
+makedhcp -a
+
+# Generate /etc/hosts and DNS zone files for all defined nodes
+makedns -n
+</code></pre>
+<p><code>makedhcp -n</code> writes the DHCP config based on your network definitions (<code>networks</code> table); <code>makedhcp -a</code> adds all node MAC/IP reservations. <code>makedns</code> keeps hostname resolution in sync so every service — Slurm, monitoring, SSH — agrees on node names.</p>
+</div>
+
+<div class="card">
+<h3>Step 5 — Provision the nodes</h3>
+<pre><code># Tell xCAT what should happen on next boot for this group
+nodeset compute osimage=rocky9.3-x86_64-install-compute
+
+# Power the nodes on (or reboot) to kick off PXE boot + install
+rpower compute boot
+
+# Watch console output live while it installs
+rcons cn01
+
+# Poll progress across the group
+nodestat compute
+</code></pre>
+<p>For stateless nodes, the equivalent is <code>nodeset compute osimage=rocky9.3-x86_64-netboot-compute</code> followed by the same <code>rpower compute boot</code> — the node now nets-boots straight into RAM every time instead of installing to disk.</p>
+</div>
+
+<div class="card">
+<h3>Step 6 — Post-install configuration and Slurm integration</h3>
+<p>Postscripts are shell/Perl scripts stored on the management node and run on the node right after deployment (and optionally on every boot for stateless nodes). Associate them via the <code>postscripts</code> table or <code>chdef</code>:</p>
+<pre><code># Attach postscripts to the compute group
+chdef -t group compute -p postscripts=configureslurm,syncntp,confignfs
+
+# Push out an ad-hoc command/script to a live group right now (no reboot needed)
+xdsh compute "systemctl restart slurmd"
+xdcp compute /etc/munge/munge.key /etc/munge/munge.key
+</code></pre>
+<p>A typical <code>configureslurm</code> postscript installs the Slurm compute daemon, writes <code>slurm.conf</code>/<code>gres.conf</code> (for GPU nodes), copies the Munge auth key from the management node, and enables/starts <code>slurmd</code> — completing the hand-off from "bare metal" to "member of the job scheduler," which is the topic of a later section in this guide.</p>
+</div>
+
+<h2>Stateful vs. stateless — provisioning path compared</h2>
+<svg class="diagram" viewBox="0 0 900 400" xmlns="http://www.w3.org/2000/svg">
+  <text x="450" y="28" text-anchor="middle" fill="#e8edf4" font-size="16" font-weight="700">Stateful (Diskful) vs. Stateless (Diskless) Provisioning</text>
+
+  <text x="225" y="55" text-anchor="middle" fill="#76b900" font-size="13" font-weight="700">Stateful — install to disk</text>
+  <rect x="60" y="70" width="330" height="46" rx="6" fill="#141c2b" stroke="#25324a"/>
+  <text x="225" y="98" text-anchor="middle" fill="#9fb0c3" font-size="11">PXE boot → kickstart/AutoYaST installer</text>
+  <rect x="60" y="128" width="330" height="46" rx="6" fill="#141c2b" stroke="#25324a"/>
+  <text x="225" y="156" text-anchor="middle" fill="#9fb0c3" font-size="11">Packages installed to local /dev/sda</text>
+  <rect x="60" y="186" width="330" height="46" rx="6" fill="#141c2b" stroke="#25324a"/>
+  <text x="225" y="214" text-anchor="middle" fill="#9fb0c3" font-size="11">Reboots into disk-resident OS</text>
+  <rect x="60" y="244" width="330" height="46" rx="6" fill="#1a2437" stroke="#76b900"/>
+  <text x="225" y="272" text-anchor="middle" fill="#e8edf4" font-size="11">State persists across reboots</text>
+  <text x="225" y="310" text-anchor="middle" fill="#9fb0c3" font-size="10">+ local scratch, full disk perf</text>
+  <text x="225" y="326" text-anchor="middle" fill="#9fb0c3" font-size="10">− drift risk, slower re-image</text>
+
+  <line x1="450" y1="50" x2="450" y2="360" stroke="#25324a" stroke-width="1"/>
+
+  <text x="675" y="55" text-anchor="middle" fill="#4fc3f7" font-size="13" font-weight="700">Stateless — boot to RAM</text>
+  <rect x="510" y="70" width="330" height="46" rx="6" fill="#141c2b" stroke="#25324a"/>
+  <text x="675" y="98" text-anchor="middle" fill="#9fb0c3" font-size="11">PXE boot → fetch packed root image</text>
+  <rect x="510" y="128" width="330" height="46" rx="6" fill="#141c2b" stroke="#25324a"/>
+  <text x="675" y="156" text-anchor="middle" fill="#9fb0c3" font-size="11">Image built once via genimage/packimage</text>
+  <rect x="510" y="186" width="330" height="46" rx="6" fill="#141c2b" stroke="#25324a"/>
+  <text x="675" y="214" text-anchor="middle" fill="#9fb0c3" font-size="11">Loaded into tmpfs / ramdisk</text>
+  <rect x="510" y="244" width="330" height="46" rx="6" fill="#1a2437" stroke="#4fc3f7"/>
+  <text x="675" y="272" text-anchor="middle" fill="#e8edf4" font-size="11">Identical image every boot (no drift)</text>
+  <text x="675" y="310" text-anchor="middle" fill="#9fb0c3" font-size="10">+ instant node replace, no drift</text>
+  <text x="675" y="326" text-anchor="middle" fill="#9fb0c3" font-size="10">− uses RAM, image rebuild for changes</text>
+</svg>
+
+<h2>xCAT vs. BCM vs. Warewulf — a quick gut check</h2>
+<table>
+<tr><th>Tool</th><th>Model</th><th>Strengths</th><th>Trade-offs</th></tr>
+<tr><td>xCAT</td><td>Free, open-source, CLI/DB-driven</td><td>Extremely flexible, mature (20+ yrs), scales to huge/hierarchical clusters, no license cost</td><td>Steeper learning curve, no polished GUI, community support only (unless via IBM/vendor contract)</td></tr>
+<tr><td>BCM (Bright)</td><td>Commercial, GUI + CLI</td><td>Turnkey experience, vendor support, integrated monitoring</td><td>License cost, more opinionated/less transparent internals</td></tr>
+<tr><td>Warewulf</td><td>Free, open-source, lightweight, container-image based</td><td>Simple mental model, fast for stateless-first clusters, modern OCI-image workflow</td><td>Smaller ecosystem than xCAT for complex hardware management (power/console) at very large scale</td></tr>
+</table>
+<div class="callout warn">
+<div class="label">Watch out</div>
+xCAT's flexibility is also its biggest trap for newcomers: because almost everything is configurable at the table level, it's easy to end up with an undocumented, hand-tuned management node that only one person understands. Keep your node definitions, osimages, and postscripts in version control from day one.
+</div>
+
+<h2>Further Reading</h2>
+<ul>
+<li><a href="https://xcat-docs.readthedocs.io/en/stable/">xCAT Documentation (Read the Docs, stable)</a></li>
+<li><a href="https://xcat-docs.readthedocs.io/en/stable/guides/admin-guides/basic_concepts/xcat_object/index.html">xCAT Objects — basic concepts</a></li>
+<li><a href="https://xcat-docs.readthedocs.io/en/stable/advanced/mixed_cluster/building_stateless_images.html">Building Stateless/Diskless Images</a></li>
+<li><a href="https://xcat-docs.readthedocs.io/en/stable/advanced/mixed_cluster/power/diskful.html">Provision x86 Diskful</a></li>
+<li><a href="https://xcat-docs.readthedocs.io/en/stable/guides/admin-guides/references/man7/node.7.html">node(7) man page — xCAT node object reference</a></li>
+<li><a href="https://sourceforge.net/p/xcat/wiki/XCAT_Commands/">xCAT Commands — wiki reference</a></li>
+<li><a href="https://sourceforge.net/p/xcat/wiki/XCAT_P8LE_Hardware_Management/">xCAT Hardware Management (mkdef/rpower/rcons examples)</a></li>
+<li><a href="https://github.com/xcat2/xcat-core">xcat2/xcat-core on GitHub</a></li>
+</ul>
+
+<div class="section-nav"><a href="04-provisioning-bcm.html">← Provisioning with BCM</a><a href="06-provisioning-warewulf-openhpc.html">Next: Warewulf + OpenHPC →</a></div>
+</main></div>
+<footer><div class="wrap">Part of the HPC Cluster Build Guide.</div></footer>
+</body>
+</html>

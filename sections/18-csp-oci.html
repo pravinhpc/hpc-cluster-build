@@ -1,0 +1,151 @@
+<!DOCTYPE html>
+<html data-theme="dark">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>18 — Building an HPC/AI GPU Cluster on OCI | HPC Cluster Build Guide</title>
+<link rel="stylesheet" href="../assets/css/style.css">
+</head>
+<body>
+<header class="top"><div class="wrap"><a href="../index.html">HPC Cluster Build Guide</a><span class="badge">Public Edition</span></div></header>
+<div class="wrap"><nav class="crumbs"><a href="17-csp-azure.html">← CSP Build — Azure</a></nav>
+<main>
+
+<h1>18 — Building an HPC/AI GPU Cluster on Oracle Cloud Infrastructure (OCI)</h1>
+<p class="lede">Oracle Cloud Infrastructure takes a distinctly bare-metal-first approach to GPU clusters. Instead of virtualizing GPU nodes, OCI hands you the physical host directly, wires it into a dedicated RDMA fabric via a construct called a <strong>cluster network</strong>, and lets you provision the whole thing with Terraform. This page is a condensed overview of what that stack looks like and how to stand up the network layer end to end; the internal edition of this guide goes much deeper on operational realities.</p>
+
+<h2>GPU shapes</h2>
+<p>OCI's GPU compute is offered almost entirely as bare metal ("BM") shapes — you get the whole physical server, not a hypervisor slice of one. The shapes relevant to HPC/AI cluster builds:</p>
+<table>
+<tr><th>Shape</th><th>GPUs</th><th>CPU</th><th>Local NVMe</th><th>Per-node RDMA bandwidth</th></tr>
+<tr><td>BM.GPU.A100-v2.8</td><td>8× A100 80GB</td><td>AMD EPYC 7J13</td><td>~27 TB (4 drives)</td><td>16 × 100 Gbps</td></tr>
+<tr><td>BM.GPU.H100.8</td><td>8× H100 80GB</td><td>2× Intel Sapphire Rapids 8480+</td><td>16 × 3.84 TB</td><td>8 × 2 × 200 Gbps</td></tr>
+<tr><td>BM.GPU.H200.8</td><td>8× H200 141GB</td><td>2× Intel Sapphire Rapids 8480+</td><td>8 × 3.84 TB</td><td>8 × 400 Gbps</td></tr>
+<tr><td>BM.GPU.B200.8</td><td>8× B200 180GB</td><td>2× Intel Emerald Rapids 8592+</td><td>8 × 3.84 TB</td><td>8 × 400 Gbps</td></tr>
+</table>
+<p>Every one of these shapes ships with a set of dedicated RDMA NICs separate from the host's management/VCN NIC — that RDMA fabric is what "cluster networking" actually configures.</p>
+
+<h2>The RDMA cluster network fabric</h2>
+<p>OCI's high-performance interconnect for bare-metal GPU and HPC shapes is built on <strong>RDMA over Converged Ethernet v2 (RoCE v2)</strong> running over NVIDIA ConnectX NICs, not classic InfiniBand. To actually get low-latency, high-bandwidth node-to-node communication (the kind NCCL/collective operations need), a GPU instance has to be launched as a member of a <strong>compute cluster</strong> or a <strong>cluster network with instance pools</strong> — a placement construct that groups instances physically close together and wires their RDMA NICs into the same non-blocking fabric segment. Instances launched independently, outside a cluster network, do not automatically get this topology-aware placement.</p>
+<p>A cluster network with instance pools is defined by an instance configuration (the shape, image, boot volume, and network attachments a node should have) plus a placement configuration (availability domain, fault domains, and the target instance count). OCI enforces same-fabric placement for every instance in the pool, and exposes a secondary VNIC per RDMA port so the GPU driver stack (typically the appropriate NIC/OFED-equivalent driver set plus NCCL) can bind to it directly.</p>
+
+<h2>VCN and subnet design</h2>
+<p>A typical OCI GPU cluster VCN separates traffic into distinct subnets: a <strong>client/management subnet</strong> for SSH, provisioning, and API traffic; a <strong>storage subnet</strong> reachable by both compute and any Lustre/File Storage endpoints; and the <strong>RDMA network</strong>, which is not a normal routable VCN subnet at all — it's the dedicated backend fabric that cluster networking wires up automatically per instance. Security lists / network security groups are applied at the client and storage subnet level; the RDMA fabric is isolated by construction rather than by security-list rule.
+
+<h2>Storage: File Storage and Lustre</h2>
+<p>For shared, POSIX-accessible storage in front of GPU training and checkpointing workloads, OCI offers two main paths: standard <strong>OCI File Storage</strong> (NFS), including high-performance mount targets that scale into the tens of Gbps per mount target and can be combined for higher aggregate throughput; and <strong>OCI File Storage with Lustre</strong>, a managed parallel filesystem purpose-built for the throughput and IOPS profile of large-scale GPU training clusters, capable of scaling to hundreds of GB/s aggregate throughput across many client nodes.</p>
+
+<h2>IAM policies</h2>
+<p>OCI IAM is policy-statement based rather than role-attachment based. A minimal cluster-build policy set typically grants a dynamic group (or a named group of cluster administrators) the ability to manage compute-cluster, instance-pool, instance-configuration, and virtual-network-family resources in the target compartment, plus read access to the image and boot-volume families. Isolating the GPU cluster into its own compartment, with policies scoped to that compartment rather than the tenancy root, is the standard pattern for keeping blast radius small.</p>
+
+<h2>Diagram: OCI GPU cluster network architecture</h2>
+<svg class="diagram" viewBox="0 0 900 340" xmlns="http://www.w3.org/2000/svg">
+  <style>
+    .lbl{font-family:sans-serif;font-size:13px;fill:#e8edf4}
+    .lbl2{font-family:sans-serif;font-size:11px;fill:#9fb0c3}
+    .box{fill:#1a2437;stroke:#25324a;stroke-width:1.5}
+    .accent{fill:#141c2b;stroke:#76b900;stroke-width:2}
+    .line{stroke:#4fc3f7;stroke-width:1.5;fill:none}
+  </style>
+  <rect x="20" y="20" width="860" height="300" fill="#0d1420" stroke="#25324a"/>
+  <rect x="330" y="30" width="240" height="60" rx="8" class="accent"/>
+  <text x="450" y="55" text-anchor="middle" class="lbl" font-weight="bold">Cluster Network</text>
+  <text x="450" y="75" text-anchor="middle" class="lbl2">Instance pool + placement config</text>
+
+  <rect x="60" y="140" width="160" height="60" rx="6" class="box"/>
+  <text x="140" y="165" text-anchor="middle" class="lbl2">BM.GPU.H100.8</text>
+  <text x="140" y="182" text-anchor="middle" class="lbl2">8× RDMA NIC (RoCEv2)</text>
+
+  <rect x="370" y="140" width="160" height="60" rx="6" class="box"/>
+  <text x="450" y="165" text-anchor="middle" class="lbl2">BM.GPU.H100.8</text>
+  <text x="450" y="182" text-anchor="middle" class="lbl2">8× RDMA NIC (RoCEv2)</text>
+
+  <rect x="680" y="140" width="160" height="60" rx="6" class="box"/>
+  <text x="760" y="165" text-anchor="middle" class="lbl2">BM.GPU.H100.8</text>
+  <text x="760" y="182" text-anchor="middle" class="lbl2">8× RDMA NIC (RoCEv2)</text>
+
+  <line x1="450" y1="90" x2="140" y2="140" class="line"/>
+  <line x1="450" y1="90" x2="450" y2="140" class="line"/>
+  <line x1="450" y1="90" x2="760" y2="140" class="line"/>
+
+  <rect x="20" y="230" width="860" height="18" fill="#111826" stroke="#25324a"/>
+  <text x="450" y="243" text-anchor="middle" class="lbl2">Client/management subnet (VCN) — SSH, provisioning, API</text>
+
+  <rect x="290" y="270" width="320" height="45" rx="6" class="box"/>
+  <text x="450" y="290" text-anchor="middle" class="lbl2">File Storage with Lustre / HPMT NFS</text>
+  <text x="450" y="306" text-anchor="middle" class="lbl2">shared checkpoint + dataset storage</text>
+</svg>
+
+<h2>Step-by-step: building the cluster network</h2>
+<div class="card">
+<h3>Step 1 — Create the VCN and subnets</h3>
+<p>Stand up a VCN with a client subnet for management traffic and (optionally) a storage subnet for File Storage/Lustre mount targets. The RDMA fabric itself is not a subnet you create — it's provisioned automatically as part of the cluster network.</p>
+</div>
+<div class="card">
+<h3>Step 2 — Define an instance configuration</h3>
+<p>An instance configuration captures the shape, image, boot volume size, and VNIC attachments every node in the pool should get.</p>
+</div>
+<div class="card">
+<h3>Step 3 — Create the cluster network with instance pool</h3>
+<p>Point a cluster-network resource at the instance configuration, set the target size, and OCI places every instance in the pool on the same RDMA fabric segment.</p>
+</div>
+<div class="card">
+<h3>Step 4 — Attach shared storage and configure the workload manager</h3>
+<p>Mount File Storage/Lustre from every node, then layer Slurm or your scheduler of choice on top exactly as you would on-prem.</p>
+</div>
+
+<pre><code># main.tf — minimal OCI cluster network with instance pool
+resource "oci_core_instance_configuration" "gpu_h100" {
+  compartment_id = var.compartment_ocid
+  display_name   = "gpu-h100-instance-config"
+
+  instance_details {
+    instance_type = "compute"
+    launch_details {
+      compartment_id = var.compartment_ocid
+      shape          = "BM.GPU.H100.8"
+      source_details {
+        source_type = "image"
+        image_id    = var.gpu_image_ocid
+      }
+      create_vnic_details {
+        subnet_id        = oci_core_subnet.client_subnet.id
+        assign_public_ip = false
+      }
+    }
+  }
+}
+
+resource "oci_core_cluster_network" "gpu_cluster" {
+  compartment_id = var.compartment_ocid
+  display_name   = "gpu-h100-cluster-net"
+
+  instance_pools {
+    instance_configuration_id = oci_core_instance_configuration.gpu_h100.id
+    size                      = 32
+    display_name              = "gpu-h100-pool"
+
+    placement_configurations {
+      availability_domain = var.availability_domain
+      primary_subnet_id   = oci_core_subnet.client_subnet.id
+    }
+  }
+}
+</code></pre>
+
+<h2>Further Reading</h2>
+<ul>
+  <li><a href="https://docs.oracle.com/en-us/iaas/Content/Compute/References/computeshapes.htm" target="_blank" rel="noopener">OCI Documentation — Compute Shapes</a></li>
+  <li><a href="https://docs.oracle.com/en-us/iaas/tools/terraform-provider-oci/latest/docs/r/core_cluster_network.html" target="_blank" rel="noopener">OCI Terraform Provider — oci_core_cluster_network Resource</a></li>
+  <li><a href="https://github.com/oracle-quickstart/oci-hpc" target="_blank" rel="noopener">oracle-quickstart/oci-hpc — Terraform Examples for HPC Clusters on OCI</a></li>
+  <li><a href="https://docs.oracle.com/en-us/iaas/Content/lustre/overview.htm" target="_blank" rel="noopener">OCI Documentation — Overview of File Storage with Lustre</a></li>
+  <li><a href="https://access.redhat.com/solutions/7025304" target="_blank" rel="noopener">Red Hat — Configuring InfiniBand Interfaces for RoCE on OCI Bare Metal Shapes</a></li>
+  <li><a href="https://www.oracle.com/cloud/hpc/" target="_blank" rel="noopener">Oracle Cloud — High Performance Computing (HPC)</a></li>
+</ul>
+
+<div class="section-nav"><a href="17-csp-azure.html">← CSP Build — Azure</a><a href="19-csp-comparison.html">Next: CSP Comparison →</a></div>
+</main>
+</div>
+<footer><div class="wrap">Part of the HPC Cluster Build Guide.</div></footer>
+</body>
+</html>

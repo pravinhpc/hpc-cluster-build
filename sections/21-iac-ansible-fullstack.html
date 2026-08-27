@@ -1,0 +1,200 @@
+<!DOCTYPE html>
+<html data-theme="dark" lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>IaC — Ansible as Full-Stack Cluster Configuration Management | HPC Cluster Build Guide</title>
+<link rel="stylesheet" href="../assets/css/style.css">
+</head>
+<body>
+<header class="top"><div class="wrap"><a href="../index.html">HPC Cluster Build Guide</a><span class="badge">Public Edition</span></div></header>
+<div class="wrap"><nav class="crumbs"><a href="20-iac-terraform.html">← IaC — Terraform</a></nav>
+<main>
+
+<h1>21 — IaC: Ansible as a Full-Stack Cluster Configuration-Management Solution</h1>
+<p class="lede">Elsewhere in this guide, <a href="07-provisioning-baremetal-ansible.html">section 07</a> uses Ansible narrowly — as the glue between a kickstart file and a working bare-metal node. This section is the broader picture: Ansible as the day-1-through-day-2 configuration-management layer across an entire HPC cluster, cloud or on-prem, sitting on top of whatever provisioned the infrastructure in the first place (usually Terraform). Same tool, much bigger job — full role structure, dynamic inventory pulled live from a cloud API instead of a static file, secrets management, and the monitoring stack, all driven by one set of playbooks.</p>
+
+<h2>Where Ansible sits in the stack</h2>
+<p>Terraform (or a cloud-native equivalent) answers "what infrastructure exists" — VPCs, subnets, VM/instance groups, load balancers, storage volumes, IAM roles. Ansible answers "what's running on top of it" — packages, users, drivers, services, configuration files, and their desired running state. The division of labor matters: Terraform is declarative over infrastructure resources with state tracking; Ansible is procedural over running hosts with no persistent state of its own — it re-derives what needs to change each run by comparing the target state in a playbook against whatever it finds on the host. Neither tool does the other's job well, and trying to make Terraform manage OS-level configuration (or Ansible manage cloud resource lifecycles) usually ends in something more fragile than just using both together.</p>
+<div class="callout tip"><div class="label">Rule of thumb</div>If a change means creating, resizing, or destroying a cloud resource, it's Terraform's job. If a change means installing a package, editing a config file, or restarting a service on a host that already exists, it's Ansible's job. The handoff point is almost always "the instance boots and Ansible takes over from there."</div>
+
+<h2>A realistic role structure</h2>
+<p>A full-stack HPC cluster playbook set is organized as a handful of composable roles, each owning one concern, applied to different host groups:</p>
+<table>
+<thead><tr><th>Role</th><th>Applies to</th><th>Responsibility</th></tr></thead>
+<tbody>
+<tr><td><code>common</code></td><td>all nodes</td><td>Base OS hardening, NTP/chrony, package repos, admin users, SSH keys</td></tr>
+<tr><td><code>ldap-sssd-client</code></td><td>all nodes</td><td>Centralized auth against LDAP/AD via SSSD, so login/compute nodes share one user directory</td></tr>
+<tr><td><code>gpu-drivers</code></td><td>GPU nodes</td><td>NVIDIA driver + CUDA toolkit install, pinned to a version compatible with the fleet's kernel</td></tr>
+<tr><td><code>ib-rdma-drivers</code></td><td>GPU/high-BW nodes</td><td>MLNX_OFED / DOCA-OFED InfiniBand or RoCE stack, matched to kernel version</td></tr>
+<tr><td><code>munge</code></td><td>controller + compute + login</td><td>Shared-secret key distribution for Slurm authentication</td></tr>
+<tr><td><code>slurm-controller</code></td><td>controller node(s)</td><td>slurmctld, slurmdbd, slurm.conf templated from inventory</td></tr>
+<tr><td><code>slurm-compute</code></td><td>compute nodes</td><td>slurmd, gres.conf for GPU resources, cgroup config</td></tr>
+<tr><td><code>nfs-client</code></td><td>compute + login</td><td>Mount shared home/scratch filesystems</td></tr>
+<tr><td><code>monitoring-agent</code></td><td>all nodes</td><td>node_exporter, DCGM exporter (GPU nodes), log shipper</td></tr>
+</tbody>
+</table>
+<p>Each role is independently testable and independently reusable — the same <code>gpu-drivers</code> role runs whether the node came from AWS, GCP, Azure, OCI, or bare metal, because it only cares about the running OS, not how the instance was created.</p>
+
+<h2>The key differentiator: dynamic inventory</h2>
+<p>Section 07's bare-metal approach uses a static inventory file — a fixed list of hostnames, hand-maintained in git. That works when nodes are physical and rarely change. It breaks down fast in a cloud-native, autoscaling, or spot-instance-heavy environment, where the set of live nodes changes hour to hour and a static file goes stale the moment anything scales.</p>
+<p>The fix is a <strong>dynamic inventory plugin</strong>: instead of reading a file, Ansible queries the cloud provider's API at run time and builds the inventory from whatever is actually running, grouped automatically by tags.</p>
+<pre><code># inventory/aws_ec2.yml — amazon.aws.aws_ec2 dynamic inventory plugin
+plugin: amazon.aws.aws_ec2
+regions:
+  - us-east-1
+filters:
+  tag:Cluster: hpc-prod
+  instance-state-name: running
+keyed_groups:
+  - key: tags.Role          # e.g. "compute", "login", "controller"
+    prefix: role
+  - key: tags.HasGPU
+    prefix: gpu
+compose:
+  ansible_host: private_ip_address
+cache: true
+cache_plugin: jsonfile
+cache_timeout: 300
+</code></pre>
+<p>Run <code>ansible-inventory -i inventory/aws_ec2.yml --graph</code> and Ansible groups hosts as <code>role_compute</code>, <code>role_login</code>, <code>gpu_true</code>, etc. — automatically, from tags, with no manual editing. Equivalent plugins exist for the other major clouds: <code>google.cloud.gcp_compute</code> for GCP, <code>azure.azcollection.azure_rm</code> for Azure, and <code>openstack.cloud.openstack</code> or vendor-specific plugins for OCI. Point a playbook at <code>-i inventory/</code> (a directory) and Ansible merges multiple dynamic sources — useful for hybrid or multi-cloud clusters.</p>
+<div class="callout warn"><div class="label">Watch for</div>Dynamic inventory results are cached by default (<code>cache_timeout</code> above) to avoid hammering the cloud API on every playbook run. During a rapid autoscale event, a stale cache means Ansible targets a node list that's already out of date. Set a short timeout for volatile environments, or force a refresh with <code>--flush-cache</code> before any run that must see live state.</div>
+
+<h2>Secrets: Ansible Vault</h2>
+<p>Munge keys, LDAP bind passwords, Grafana admin credentials, and API tokens for the monitoring stack all need to live in git without being readable in git. <a href="https://docs.ansible.com/projects/ansible/latest/vault_guide/index.html" target="_blank" rel="noopener">Ansible Vault</a> encrypts variable files (or individual strings) with a shared password or a KMS-backed vault ID, and Ansible transparently decrypts them at run time.</p>
+<pre><code># Encrypt a whole file of secrets
+ansible-vault encrypt group_vars/all/vault.yml
+
+# Encrypt a single string for inline use in a vars file
+ansible-vault encrypt_string 'S3cr3t!' --name 'ldap_bind_password'
+
+# Run a playbook, supplying the vault password
+ansible-playbook site.yml --vault-id prod@prompt
+</code></pre>
+<p>Keep vault-encrypted files as normal git-tracked YAML (they diff and review fine as ciphertext blobs); keep the vault password itself out of git entirely — a password manager, a CI secret store, or a KMS-backed vault ID script.</p>
+
+<h2>A full end-to-end playbook</h2>
+<p>A realistic top-level playbook chains every role above in dependency order, targeting the dynamic-inventory groups:</p>
+<pre><code># playbooks/site.yml
+- hosts: all
+  become: true
+  roles:
+    - common
+    - ldap-sssd-client
+    - monitoring-agent
+
+- hosts: role_compute:role_login
+  become: true
+  roles:
+    - ib-rdma-drivers
+    - nfs-client
+    - munge
+
+- hosts: gpu_true
+  become: true
+  roles:
+    - gpu-drivers
+
+- hosts: role_controller
+  become: true
+  roles:
+    - munge
+    - slurm-controller
+
+- hosts: role_compute
+  become: true
+  roles:
+    - slurm-compute
+</code></pre>
+<p>Run it against live cloud state with:</p>
+<pre><code>ansible-playbook -i inventory/aws_ec2.yml playbooks/site.yml --diff</code></pre>
+<p>No hostnames are hardcoded anywhere — new compute nodes that appear (autoscaling, a manual Terraform apply, spot fleet churn) are picked up automatically the next time the dynamic inventory plugin queries the API, and the same playbook configures them without edits.</p>
+
+<h2>Monitoring as part of the same automation</h2>
+<p>The <code>monitoring-agent</code> role installs and configures the observability stack alongside everything else, rather than as a separate manual step:</p>
+<ul>
+<li><strong>node_exporter</strong> on every host — CPU, memory, disk, network metrics</li>
+<li><strong>DCGM exporter</strong> on GPU nodes — GPU utilization, memory, temperature, XID errors, ECC counts</li>
+<li><strong>Prometheus</strong> (typically on a dedicated monitoring host or controller) scraping both, service-discovering compute targets from the same dynamic inventory data</li>
+<li><strong>Grafana</strong> provisioned with dashboards-as-code (JSON dashboards checked into the same repo, applied via the Grafana provisioning API or an Ansible role)</li>
+</ul>
+<p>Because the monitoring agents are installed by the same playbook run as everything else, a newly provisioned node is observable from the moment it joins the cluster — there's no separate onboarding step for monitoring to fall out of sync with compute.</p>
+
+<h2>Role/playbook architecture</h2>
+<svg class="diagram" viewBox="0 0 900 380" xmlns="http://www.w3.org/2000/svg">
+<defs>
+<marker id="arrow21a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+<path d="M0,0 L10,5 L0,10 z" fill="#76b900"/>
+</marker>
+</defs>
+<style>
+.n{fill:#1a2437;stroke:#25324a;stroke-width:1.5;rx:8}
+.t{fill:#e8edf4;font-family:sans-serif;font-size:14px;text-anchor:middle}
+.s{fill:#9fb0c3;font-family:sans-serif;font-size:11px;text-anchor:middle}
+.l{stroke:#76b900;stroke-width:2;fill:none;marker-end:url(#arrow21a)}
+</style>
+<rect x="20" y="150" width="170" height="80" class="n"/>
+<text x="105" y="182" class="t">Cloud API</text>
+<text x="105" y="200" class="t">(AWS/GCP/Azure/OCI)</text>
+<text x="105" y="220" class="s">live tagged instances</text>
+
+<rect x="230" y="150" width="170" height="80" class="n" style="stroke:#76b900"/>
+<text x="315" y="182" class="t">Dynamic inventory</text>
+<text x="315" y="200" class="t">plugin</text>
+<text x="315" y="220" class="s">grouped by tag: role, gpu</text>
+
+<rect x="440" y="40" width="170" height="60" class="n"/>
+<text x="525" y="66" class="t">common / ldap-sssd</text>
+<text x="525" y="84" class="s">all nodes</text>
+
+<rect x="440" y="115" width="170" height="60" class="n"/>
+<text x="525" y="141" class="t">gpu-drivers / ib-rdma</text>
+<text x="525" y="159" class="s">GPU + high-BW nodes</text>
+
+<rect x="440" y="190" width="170" height="60" class="n"/>
+<text x="525" y="216" class="t">munge / slurm-*</text>
+<text x="525" y="234" class="s">controller + compute</text>
+
+<rect x="440" y="265" width="170" height="60" class="n"/>
+<text x="525" y="291" class="t">monitoring-agent</text>
+<text x="525" y="309" class="s">DCGM + node_exporter</text>
+
+<rect x="670" y="130" width="190" height="100" class="n" style="fill:#141c2b;stroke:#76b900"/>
+<text x="765" y="165" class="t">Working cluster,</text>
+<text x="765" y="183" class="t">observable from</text>
+<text x="765" y="201" class="t">first boot</text>
+
+<line x1="190" y1="190" x2="226" y2="190" class="l"/>
+<line x1="400" y1="175" x2="436" y2="80" class="l"/>
+<line x1="400" y1="185" x2="436" y2="150" class="l"/>
+<line x1="400" y1="200" x2="436" y2="220" class="l"/>
+<line x1="400" y1="215" x2="436" y2="290" class="l"/>
+<line x1="610" y1="80" x2="666" y2="170" class="l"/>
+<line x1="610" y1="150" x2="666" y2="180" class="l"/>
+<line x1="610" y1="225" x2="666" y2="195" class="l"/>
+<line x1="610" y1="295" x2="666" y2="215" class="l"/>
+</svg>
+
+<h2>Idempotency and Molecule testing</h2>
+<p>Same discipline as any other Ansible workload, at higher stakes because a full-stack cluster playbook touches the scheduler and the monitoring layer, not just the OS. <a href="https://ansible.readthedocs.io/projects/molecule/" target="_blank" rel="noopener">Molecule</a> tests each role in isolation — create a throwaway container, converge, assert zero changes on a second converge, verify, destroy — so a broken <code>slurm-compute</code> or <code>monitoring-agent</code> role is caught in CI, never against a live cluster.</p>
+
+<h2>Further Reading</h2>
+<ul>
+<li><a href="https://docs.ansible.com/projects/ansible/latest/collections/amazon/aws/docsite/aws_ec2_guide.html" target="_blank" rel="noopener">Ansible aws_ec2 Dynamic Inventory Plugin Guide</a></li>
+<li><a href="https://docs.ansible.com/projects/ansible/latest/collections/amazon/aws/aws_ec2_inventory.html" target="_blank" rel="noopener">amazon.aws.aws_ec2 inventory plugin reference</a></li>
+<li><a href="https://docs.ansible.com/projects/ansible/latest/collections/index_inventory.html" target="_blank" rel="noopener">Index of all Ansible Inventory Plugins (incl. gcp_compute, azure_rm)</a></li>
+<li><a href="https://docs.ansible.com/projects/ansible/latest/vault_guide/index.html" target="_blank" rel="noopener">Protecting sensitive data with Ansible Vault</a></li>
+<li><a href="https://ansible.readthedocs.io/projects/molecule/" target="_blank" rel="noopener">Molecule — Ansible role testing framework</a></li>
+<li><a href="https://github.com/ansible/molecule/" target="_blank" rel="noopener">ansible/molecule on GitHub</a></li>
+<li><a href="https://github.com/stackhpc/ansible-role-openhpc" target="_blank" rel="noopener">stackhpc/ansible-role-openhpc — OpenHPC v2.x Slurm cluster via Ansible</a></li>
+<li><a href="https://github.com/pbouchez/ansible-role-dcgm-exporter" target="_blank" rel="noopener">Ansible role for NVIDIA DCGM Exporter</a></li>
+<li><a href="https://github.com/cloudalchemy/ansible-node-exporter" target="_blank" rel="noopener">cloudalchemy/ansible-node-exporter — node_exporter role</a></li>
+<li><a href="https://galaxy.ansible.com/ui/repo/published/prometheus/prometheus/content/role/node_exporter/" target="_blank" rel="noopener">prometheus.prometheus node_exporter role (Ansible Galaxy)</a></li>
+<li><a href="https://developer.hashicorp.com/terraform/docs" target="_blank" rel="noopener">Terraform Documentation</a></li>
+</ul>
+
+<div class="section-nav"><a href="20-iac-terraform.html">← IaC — Terraform</a><a href="22-iac-puppet.html">Next: IaC — Puppet →</a></div>
+</main></div>
+<footer><div class="wrap">Part of the HPC Cluster Build Guide.</div></footer>
+</body>
+</html>

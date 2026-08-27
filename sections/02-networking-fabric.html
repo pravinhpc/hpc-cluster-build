@@ -1,0 +1,277 @@
+<!DOCTYPE html>
+<html data-theme="dark">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Networking & Fabric: InfiniBand, RoCE, RDMA, and Topology — HPC Cluster Build Guide</title>
+<link rel="stylesheet" href="../assets/css/style.css">
+</head>
+<body>
+<header class="top"><div class="wrap"><a href="../index.html">HPC Cluster Build Guide</a><span class="badge">Public Edition</span></div></header>
+<div class="wrap"><nav class="crumbs"><a href="01-compute-hardware.html">← Compute & Hardware</a></nav>
+<main>
+
+<h1>Networking & Fabric: InfiniBand, RoCE, RDMA, and Topology</h1>
+<p class="lede">A rack of the fastest GPUs on earth is only as fast as the network stitching them together. This section explains why AI and HPC clusters build a dedicated, ultra-low-latency "fabric" separate from ordinary Ethernet, how RDMA and GPUDirect let GPUs talk to each other without ever bothering the CPU, the two competing fabric technologies (InfiniBand and RoCEv2/Spectrum-X), the topologies (fat-tree, dragonfly, rail-optimized) used to wire thousands of GPUs together, and a worked example sizing a network for a 128-GPU cluster.</p>
+
+<h2>Why a Special Network at All?</h2>
+<p>Every cluster already has a boring management network — the one used for SSH, monitoring, provisioning, and pulling container images. That network typically runs on standard 1/10/25 Gbps Ethernet and is optimized for cost and simplicity, not speed. It is completely inadequate for what happens during distributed AI training or HPC simulation.</p>
+<p>When a large model trains across hundreds or thousands of GPUs, every GPU must periodically exchange huge tensors of gradients and activations with every other GPU — operations like <code>all-reduce</code>, <code>all-to-all</code>, and <code>all-gather</code>. These exchanges happen many times per second, move gigabytes at a time, and the whole cluster stalls until the slowest transfer finishes. A single congested link or a few extra microseconds of latency on the critical path can slow an entire multi-thousand-GPU job. This is why clusters build a second, purpose-built network — the <strong>fabric</strong> — dedicated entirely to GPU-to-GPU traffic, running at 200–800 Gbps per link, engineered for both huge bandwidth and microsecond-scale latency, and kept physically and logically separate from the management network.</p>
+
+<div class="callout tip">
+<div class="label">Rule of thumb</div>
+Think of the management network as the office intranet (email, file shares, ordinary chatter) and the fabric as a dedicated bank of private phone lines wired directly desk-to-desk for the one conversation that must never lag: the GPUs talking to each other.
+</div>
+
+<h2>RDMA: Skipping the CPU and the Kernel</h2>
+<p>Traditional networking (plain TCP/IP over Ethernet) moves data through several slow hops: the application copies data into a kernel buffer, the kernel processes it through the full network stack, the NIC driver is invoked, and the CPU is interrupted repeatedly along the way. Each hop adds latency and consumes CPU cycles that could otherwise be doing useful work.</p>
+<p><strong>RDMA (Remote Direct Memory Access)</strong> removes nearly all of that. It lets one machine's network adapter read or write directly into another machine's memory, without involving the remote CPU and without extra data copies. The sending and receiving NICs handle the transfer using pre-registered memory regions and hardware queues; the CPU is only informed once the transfer completes (or not involved at all).</p>
+<p>For GPU workloads, NVIDIA extends this one step further with <strong>GPUDirect RDMA</strong>: it lets a NIC (or another GPU) read and write directly to and from GPU memory over the PCIe bus, completely bypassing a copy through host (CPU) system memory. Without GPUDirect RDMA, a data transfer between two GPUs on different nodes has to go: GPU memory → system RAM → NIC → wire → remote NIC → remote system RAM → remote GPU memory. With GPUDirect RDMA, it goes straight from GPU memory to NIC to wire to remote NIC to remote GPU memory — cutting latency and freeing up the CPU and PCIe bandwidth for other work. NVIDIA's official developer documentation describes this as a direct path "between the GPU and a third-party peer device using standard features of PCI Express," originally introduced with Kepler-class GPUs and CUDA 5.0.</p>
+
+<div class="card">
+<h3>GPUDirect family, briefly</h3>
+<p><strong>GPUDirect RDMA</strong> — direct GPU memory ↔ NIC transfers across nodes.<br>
+<strong>GPUDirect Storage</strong> — direct GPU memory ↔ NVMe/storage transfers, skipping a bounce buffer in system RAM.<br>
+<strong>NVLink/NVSwitch</strong> — the even-faster equivalent for GPUs inside the same node or NVLink domain (covered in the Compute & Hardware section); RDMA over InfiniBand/RoCE is what extends that same "no CPU in the middle" philosophy across nodes.</p>
+</div>
+
+<h3>RDMA vs Traditional TCP/IP — the data path</h3>
+<svg class="diagram" viewBox="0 0 900 400" xmlns="http://www.w3.org/2000/svg">
+  <text x="225" y="28" text-anchor="middle" fill="#ffb74d" font-size="16" font-weight="700">Traditional TCP/IP path</text>
+  <text x="675" y="28" text-anchor="middle" fill="#76b900" font-size="16" font-weight="700">RDMA / GPUDirect RDMA path</text>
+
+  <!-- Left column: traditional -->
+  <rect x="70" y="50" width="150" height="40" rx="6" fill="#1a2437" stroke="#25324a"/>
+  <text x="145" y="75" text-anchor="middle" fill="#e8edf4" font-size="13">GPU memory</text>
+  <rect x="70" y="120" width="150" height="40" rx="6" fill="#1a2437" stroke="#25324a"/>
+  <text x="145" y="145" text-anchor="middle" fill="#e8edf4" font-size="13">Copy to system RAM</text>
+  <rect x="70" y="190" width="150" height="40" rx="6" fill="#1a2437" stroke="#25324a"/>
+  <text x="145" y="215" text-anchor="middle" fill="#e8edf4" font-size="13">Kernel TCP/IP stack</text>
+  <rect x="70" y="260" width="150" height="40" rx="6" fill="#1a2437" stroke="#25324a"/>
+  <text x="145" y="285" text-anchor="middle" fill="#e8edf4" font-size="13">NIC driver + CPU interrupts</text>
+  <rect x="70" y="330" width="150" height="40" rx="6" fill="#1a2437" stroke="#25324a"/>
+  <text x="145" y="355" text-anchor="middle" fill="#e8edf4" font-size="13">Wire → remote (reverse path)</text>
+  <line x1="145" y1="90" x2="145" y2="120" stroke="#ff6b6b" stroke-width="2" marker-end="url(#arrow1)"/>
+  <line x1="145" y1="160" x2="145" y2="190" stroke="#ff6b6b" stroke-width="2" marker-end="url(#arrow1)"/>
+  <line x1="145" y1="230" x2="145" y2="260" stroke="#ff6b6b" stroke-width="2" marker-end="url(#arrow1)"/>
+  <line x1="145" y1="300" x2="145" y2="330" stroke="#ff6b6b" stroke-width="2" marker-end="url(#arrow1)"/>
+
+  <!-- Right column: RDMA -->
+  <rect x="600" y="50" width="150" height="40" rx="6" fill="#16241a" stroke="#76b900"/>
+  <text x="675" y="75" text-anchor="middle" fill="#e8edf4" font-size="13">GPU memory</text>
+  <rect x="600" y="140" width="150" height="40" rx="6" fill="#16241a" stroke="#76b900"/>
+  <text x="675" y="165" text-anchor="middle" fill="#e8edf4" font-size="13">NIC (RDMA engine)</text>
+  <rect x="600" y="230" width="150" height="40" rx="6" fill="#16241a" stroke="#76b900"/>
+  <text x="675" y="255" text-anchor="middle" fill="#e8edf4" font-size="13">Wire → remote NIC → remote GPU</text>
+  <line x1="675" y1="90" x2="675" y2="140" stroke="#76b900" stroke-width="3" marker-end="url(#arrow2)"/>
+  <line x1="675" y1="180" x2="675" y2="230" stroke="#76b900" stroke-width="3" marker-end="url(#arrow2)"/>
+  <text x="675" y="300" text-anchor="middle" fill="#9fb0c3" font-size="12">CPU never touches the data.</text>
+  <text x="675" y="320" text-anchor="middle" fill="#9fb0c3" font-size="12">No copy into system RAM.</text>
+
+  <line x1="330" y1="30" x2="330" y2="380" stroke="#25324a" stroke-width="1" stroke-dasharray="4,4"/>
+
+  <defs>
+    <marker id="arrow1" markerWidth="8" markerHeight="8" refX="4" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#ff6b6b"/></marker>
+    <marker id="arrow2" markerWidth="8" markerHeight="8" refX="4" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#76b900"/></marker>
+  </defs>
+</svg>
+
+<h2>The Two Fabric Choices: InfiniBand vs RoCEv2</h2>
+<p>There are two dominant ways to build an RDMA-capable fabric for GPU clusters today. Both can deliver 200–800 Gbps per link and low-microsecond latency; they differ in how they achieve lossless, congestion-free delivery, and in cost/operational trade-offs.</p>
+
+<h3>InfiniBand (NDR / HDR, NVIDIA Quantum)</h3>
+<p>InfiniBand is a purpose-built networking technology (originally standardized in 1999, now largely developed and sold by NVIDIA following the Mellanox acquisition) designed from the ground up for RDMA and lossless delivery. Current generations are <strong>HDR</strong> (200 Gbps per port) and <strong>NDR</strong> (400 Gbps per port), with NVIDIA's Quantum-2 switch line (e.g., the QM9700/QM9790, 64 ports of 400 Gb/s NDR) as the flagship hardware. Key characteristics:</p>
+<ul>
+<li><strong>Lossless by design at the link layer</strong> — credit-based flow control means a sender never transmits a packet unless the receiver has guaranteed buffer space, so there's no need to bolt on separate congestion-avoidance mechanisms.</li>
+<li><strong>Subnet Manager (SM)</strong> — a centralized control-plane service (OpenSM as an open-source option, or NVIDIA's UFM — Unified Fabric Manager — for production/enterprise deployments) that discovers the fabric topology, assigns routing tables, and manages partitioning. Every InfiniBand fabric needs exactly one active subnet manager.</li>
+<li><strong>Adaptive Routing (AR)</strong> — the fabric can dynamically shift traffic away from congested paths in real time, and NVIDIA UFM adds features like SHARP (in-network compute/aggregation offload) and SHIELD (self-healing interconnect) on top.</li>
+<li><strong>Trade-offs</strong> — InfiniBand delivers the best raw latency and the richest in-network offload features, but it means a separate switch fabric, separate cabling, separate expertise, and effectively single-vendor sourcing (NVIDIA/Mellanox dominates the market), which some operators view as lock-in.</li>
+</ul>
+
+<h3>RoCEv2 (RDMA over Converged Ethernet) / Spectrum-X</h3>
+<p>RoCEv2 runs the RDMA protocol over standard Ethernet framing (UDP/IP), which means it can, in principle, ride on commodity Ethernet switches and reuse existing Ethernet operational knowledge. But RDMA needs a lossless transport to perform well, and Ethernet is normally "best effort" (it drops packets under congestion and lets TCP retransmit). To make RoCEv2 viable at scale, the network needs:</p>
+<ul>
+<li><strong>Priority Flow Control (PFC)</strong> — a link-level pause mechanism so a switch can tell an upstream sender "stop" for a specific traffic class before its buffers overflow.</li>
+<li><strong>ECN (Explicit Congestion Notification)</strong> — routers mark packets as they approach congestion, so the sender can slow down before any packet is actually dropped, combined with congestion-control algorithms like DCQCN or NVIDIA's own NVIDIA Congestion Control (NCC).</li>
+<li><strong>NVIDIA Spectrum-X</strong> — NVIDIA's productized answer: Spectrum-4 switches paired with BlueField-3 SuperNICs / ConnectX-7/8 NICs, tuned end-to-end so that PFC, ECN, and adaptive load balancing work together to deliver "zero packet drop" lossless RoCEv2 at large GPU scale, marketed at roughly 1.6x AI workload throughput versus off-the-shelf Ethernet.</li>
+<li><strong>Trade-offs</strong> — RoCEv2/Ethernet benefits from a much broader multi-vendor ecosystem (switches, optics, NICs, and operational tooling used across the whole data center industry, not just AI), and many network teams already know Ethernet operations. Getting a truly lossless, congestion-free RoCEv2 fabric right at scale is nontrivial engineering, though — PFC storms and head-of-line blocking are real failure modes if not tuned carefully, which is precisely the problem Spectrum-X packages a validated answer to.</li>
+</ul>
+
+<table>
+<thead><tr><th>Dimension</th><th>InfiniBand (Quantum NDR/HDR)</th><th>RoCEv2 / Spectrum-X Ethernet</th></tr></thead>
+<tbody>
+<tr><td>Loss handling</td><td>Lossless natively via credit-based link flow control</td><td>Lossless bolted on via PFC + ECN + congestion control</td></tr>
+<tr><td>Control plane</td><td>Centralized Subnet Manager (OpenSM / UFM)</td><td>Standard Ethernet control plane (BGP/EVPN etc.) + telemetry</td></tr>
+<tr><td>Peak link speed (2026)</td><td>400 Gbps NDR (800G XDR emerging)</td><td>400–800 Gbps (Spectrum-4 generation)</td></tr>
+<tr><td>Vendor ecosystem</td><td>Effectively single dominant vendor (NVIDIA/Mellanox)</td><td>Broad multi-vendor Ethernet ecosystem</td></tr>
+<tr><td>Operational familiarity</td><td>Specialized IB skill set required</td><td>Leverages existing Ethernet/data-center networking skills</td></tr>
+<tr><td>Typical strength</td><td>Best raw latency + in-network compute (SHARP), proven at extreme scale</td><td>Flexibility, reuse of DC infrastructure, converged fabric for storage+compute</td></tr>
+<tr><td>Best fit</td><td>Dedicated HPC/AI supercomputers, large training superclusters</td><td>Cloud-native AI infra, mixed workloads, teams standardized on Ethernet</td></tr>
+</tbody>
+</table>
+
+<div class="callout warn">
+<div class="label">When to choose which</div>
+There's no universally "correct" answer — it depends on scale, budget, and operations. Extremely large, dedicated training superclusters (tens of thousands of GPUs, latency-critical collectives, heavy use of in-network aggregation) often favor InfiniBand for its maturity and offload features. Cloud providers and organizations that want to reuse existing Ethernet operational tooling, avoid single-vendor lock-in, or run mixed AI/general workloads over a converged fabric increasingly choose RoCEv2 with Spectrum-X, especially since the performance gap has narrowed substantially in recent generations.
+</div>
+
+<h2>Network Topologies for HPC/AI Clusters</h2>
+<p>However fast individual links are, the way switches are wired together (the <strong>topology</strong>) determines how much bandwidth is actually available between any two GPUs, and how the network behaves as the cluster scales from dozens to tens of thousands of nodes.</p>
+
+<h3>Fat-Tree / Clos Topology</h3>
+<p>The dominant topology in HPC and AI data centers is the <strong>fat-tree</strong> (a practical instance of the more general <strong>Clos network</strong> from telecom switching theory). It arranges switches in tiers — commonly <strong>leaf</strong> switches (which nodes plug directly into) and <strong>spine</strong> switches (which interconnect the leaves) — such that there are many equal-cost paths between any pair of leaves. This gives the network two prized properties: it's <em>non-blocking</em> (in principle every node can talk to every other node at full link rate simultaneously) and it tolerates failures gracefully (traffic reroutes over a surviving equal-cost path). Larger clusters add a third tier (core/super-spine) on top of leaf-spine to keep scaling out.</p>
+
+<h3>Dragonfly Topology</h3>
+<p>For the very largest supercomputers, some designs use a <strong>dragonfly</strong> topology instead: nodes are organized into densely-connected local groups, and the groups themselves are connected by a smaller number of longer global links. Dragonfly can reach extreme scale with fewer total switches and cables than a pure fat-tree of the same size, trading some worst-case path diversity for lower hardware cost — a common design point in leadership-class HPC systems, less common (but not unheard of) in commercial AI training clusters.</p>
+
+<h3>Rail-Optimized Design for GPU Clusters</h3>
+<p>Modern GPU servers (e.g., 8-GPU nodes) typically have one dedicated high-speed NIC per GPU — this per-GPU NIC is called a <strong>rail</strong>. In a <strong>rail-optimized</strong> topology, all the "rail 0" NICs (one from every server) connect to the same leaf switch, all the "rail 1" NICs connect to a different (or the same, in smaller builds) leaf switch, and so on. This lines up perfectly with how NCCL (NVIDIA's collective communications library) schedules communication: the dominant collective operations (like all-reduce during training) are scheduled so that most traffic for a given GPU rank stays within its own rail and leaf switch, only crossing to the spine for the smaller residual cross-rail traffic. The result is dramatically better collective performance and less cross-fabric interference, and it can even reduce cost since inter-leaf/spine links can be provisioned lighter than they would need to be for fully random traffic patterns.</p>
+
+<h3>Fat-Tree / Rail-Optimized Leaf-Spine Diagram</h3>
+<svg class="diagram" viewBox="0 0 900 400" xmlns="http://www.w3.org/2000/svg">
+  <text x="450" y="28" text-anchor="middle" fill="#e8edf4" font-size="15" font-weight="700">Fat-Tree / Clos: Leaf–Spine Topology</text>
+
+  <!-- Spine layer -->
+  <text x="60" y="75" fill="#9fb0c3" font-size="12">Spine</text>
+  <rect x="150" y="55" width="90" height="36" rx="6" fill="#1a2437" stroke="#4fc3f7"/><text x="195" y="78" text-anchor="middle" fill="#e8edf4" font-size="12">Spine 1</text>
+  <rect x="290" y="55" width="90" height="36" rx="6" fill="#1a2437" stroke="#4fc3f7"/><text x="335" y="78" text-anchor="middle" fill="#e8edf4" font-size="12">Spine 2</text>
+  <rect x="430" y="55" width="90" height="36" rx="6" fill="#1a2437" stroke="#4fc3f7"/><text x="475" y="78" text-anchor="middle" fill="#e8edf4" font-size="12">Spine 3</text>
+  <rect x="570" y="55" width="90" height="36" rx="6" fill="#1a2437" stroke="#4fc3f7"/><text x="615" y="78" text-anchor="middle" fill="#e8edf4" font-size="12">Spine 4</text>
+
+  <!-- Leaf layer -->
+  <text x="60" y="185" fill="#9fb0c3" font-size="12">Leaf</text>
+  <rect x="110" y="165" width="90" height="36" rx="6" fill="#1a2437" stroke="#76b900"/><text x="155" y="188" text-anchor="middle" fill="#e8edf4" font-size="12">Leaf A</text>
+  <rect x="310" y="165" width="90" height="36" rx="6" fill="#1a2437" stroke="#76b900"/><text x="355" y="188" text-anchor="middle" fill="#e8edf4" font-size="12">Leaf B</text>
+  <rect x="510" y="165" width="90" height="36" rx="6" fill="#1a2437" stroke="#76b900"/><text x="555" y="188" text-anchor="middle" fill="#e8edf4" font-size="12">Leaf C</text>
+  <rect x="700" y="165" width="90" height="36" rx="6" fill="#1a2437" stroke="#76b900"/><text x="745" y="188" text-anchor="middle" fill="#e8edf4" font-size="12">Leaf D</text>
+
+  <!-- Leaf-Spine links (subset for clarity) -->
+  <g stroke="#25324a" stroke-width="1.2">
+    <line x1="195" y1="91" x2="155" y2="165"/><line x1="195" y1="91" x2="355" y2="165"/>
+    <line x1="335" y1="91" x2="155" y2="165"/><line x1="335" y1="91" x2="555" y2="165"/>
+    <line x1="475" y1="91" x2="355" y2="165"/><line x1="475" y1="91" x2="745" y2="165"/>
+    <line x1="615" y1="91" x2="555" y2="165"/><line x1="615" y1="91" x2="745" y2="165"/>
+  </g>
+
+  <!-- Servers -->
+  <text x="60" y="290" fill="#9fb0c3" font-size="12">Nodes</text>
+  <rect x="120" y="270" width="70" height="30" rx="5" fill="#141c2b" stroke="#25324a"/><text x="155" y="290" text-anchor="middle" fill="#9fb0c3" font-size="11">Node 1-8</text>
+  <rect x="320" y="270" width="70" height="30" rx="5" fill="#141c2b" stroke="#25324a"/><text x="355" y="290" text-anchor="middle" fill="#9fb0c3" font-size="11">Node 9-16</text>
+  <rect x="520" y="270" width="70" height="30" rx="5" fill="#141c2b" stroke="#25324a"/><text x="555" y="290" text-anchor="middle" fill="#9fb0c3" font-size="11">Node 17-24</text>
+  <rect x="710" y="270" width="70" height="30" rx="5" fill="#141c2b" stroke="#25324a"/><text x="745" y="290" text-anchor="middle" fill="#9fb0c3" font-size="11">Node 25-32</text>
+  <line x1="155" y1="201" x2="155" y2="270" stroke="#25324a"/>
+  <line x1="355" y1="201" x2="355" y2="270" stroke="#25324a"/>
+  <line x1="555" y1="201" x2="555" y2="270" stroke="#25324a"/>
+  <line x1="745" y1="201" x2="745" y2="270" stroke="#25324a"/>
+
+  <text x="450" y="340" text-anchor="middle" fill="#9fb0c3" font-size="12">Every leaf connects to every spine → multiple equal-cost paths → non-blocking, fault-tolerant fabric.</text>
+  <text x="450" y="362" text-anchor="middle" fill="#9fb0c3" font-size="12">Oversubscription ratio = (node-facing bandwidth on a leaf) : (uplink bandwidth from that leaf to the spine).</text>
+</svg>
+
+<h3>Rail-Optimized GPU-to-NIC-to-Switch Layout</h3>
+<svg class="diagram" viewBox="0 0 900 400" xmlns="http://www.w3.org/2000/svg">
+  <text x="450" y="26" text-anchor="middle" fill="#e8edf4" font-size="15" font-weight="700">Rail-Optimized: One NIC per GPU, Rail-Aligned Leaf Switches</text>
+
+  <!-- Server 1 -->
+  <rect x="60" y="55" width="230" height="150" rx="8" fill="#141c2b" stroke="#25324a"/>
+  <text x="175" y="75" text-anchor="middle" fill="#9fb0c3" font-size="12">Server 1 (8x GPU node)</text>
+  <g font-size="10" fill="#e8edf4">
+    <rect x="75" y="85" width="45" height="24" rx="4" fill="#1a2437" stroke="#76b900"/><text x="97" y="101" text-anchor="middle">GPU0</text>
+    <rect x="130" y="85" width="45" height="24" rx="4" fill="#1a2437" stroke="#76b900"/><text x="152" y="101" text-anchor="middle">GPU1</text>
+    <rect x="185" y="85" width="45" height="24" rx="4" fill="#1a2437" stroke="#76b900"/><text x="207" y="101" text-anchor="middle">GPU2</text>
+    <rect x="240" y="85" width="35" height="24" rx="4" fill="#1a2437" stroke="#76b900"/><text x="257" y="101" text-anchor="middle">...</text>
+    <rect x="75" y="125" width="45" height="24" rx="4" fill="#0d1420" stroke="#4fc3f7"/><text x="97" y="141" text-anchor="middle">NIC0</text>
+    <rect x="130" y="125" width="45" height="24" rx="4" fill="#0d1420" stroke="#4fc3f7"/><text x="152" y="141" text-anchor="middle">NIC1</text>
+    <rect x="185" y="125" width="45" height="24" rx="4" fill="#0d1420" stroke="#4fc3f7"/><text x="207" y="141" text-anchor="middle">NIC2</text>
+    <rect x="240" y="125" width="35" height="24" rx="4" fill="#0d1420" stroke="#4fc3f7"/><text x="257" y="141" text-anchor="middle">...</text>
+  </g>
+  <line x1="97" y1="109" x2="97" y2="125" stroke="#76b900"/>
+  <line x1="152" y1="109" x2="152" y2="125" stroke="#76b900"/>
+  <line x1="207" y1="109" x2="207" y2="125" stroke="#76b900"/>
+
+  <!-- Server 2 -->
+  <rect x="610" y="55" width="230" height="150" rx="8" fill="#141c2b" stroke="#25324a"/>
+  <text x="725" y="75" text-anchor="middle" fill="#9fb0c3" font-size="12">Server N (8x GPU node)</text>
+  <g font-size="10" fill="#e8edf4">
+    <rect x="625" y="85" width="45" height="24" rx="4" fill="#1a2437" stroke="#76b900"/><text x="647" y="101" text-anchor="middle">GPU0</text>
+    <rect x="680" y="85" width="45" height="24" rx="4" fill="#1a2437" stroke="#76b900"/><text x="702" y="101" text-anchor="middle">GPU1</text>
+    <rect x="735" y="85" width="45" height="24" rx="4" fill="#1a2437" stroke="#76b900"/><text x="757" y="101" text-anchor="middle">GPU2</text>
+    <rect x="790" y="85" width="35" height="24" rx="4" fill="#1a2437" stroke="#76b900"/><text x="807" y="101" text-anchor="middle">...</text>
+    <rect x="625" y="125" width="45" height="24" rx="4" fill="#0d1420" stroke="#4fc3f7"/><text x="647" y="141" text-anchor="middle">NIC0</text>
+    <rect x="680" y="125" width="45" height="24" rx="4" fill="#0d1420" stroke="#4fc3f7"/><text x="702" y="141" text-anchor="middle">NIC1</text>
+    <rect x="735" y="125" width="45" height="24" rx="4" fill="#0d1420" stroke="#4fc3f7"/><text x="757" y="141" text-anchor="middle">NIC2</text>
+    <rect x="790" y="125" width="35" height="24" rx="4" fill="#0d1420" stroke="#4fc3f7"/><text x="807" y="141" text-anchor="middle">...</text>
+  </g>
+  <line x1="647" y1="109" x2="647" y2="125" stroke="#76b900"/>
+  <line x1="702" y1="109" x2="702" y2="125" stroke="#76b900"/>
+  <line x1="757" y1="109" x2="757" y2="125" stroke="#76b900"/>
+
+  <!-- Rail leaf switches -->
+  <rect x="330" y="270" width="90" height="34" rx="6" fill="#1a2437" stroke="#4fc3f7"/><text x="375" y="292" text-anchor="middle" fill="#e8edf4" font-size="11">Rail-0 Leaf</text>
+  <rect x="440" y="270" width="90" height="34" rx="6" fill="#1a2437" stroke="#4fc3f7"/><text x="485" y="292" text-anchor="middle" fill="#e8edf4" font-size="11">Rail-1 Leaf</text>
+  <rect x="550" y="270" width="90" height="34" rx="6" fill="#1a2437" stroke="#4fc3f7"/><text x="595" y="292" text-anchor="middle" fill="#e8edf4" font-size="11">Rail-2 Leaf</text>
+
+  <line x1="97" y1="149" x2="375" y2="270" stroke="#4fc3f7" stroke-width="1"/>
+  <line x1="647" y1="149" x2="375" y2="270" stroke="#4fc3f7" stroke-width="1"/>
+  <line x1="152" y1="149" x2="485" y2="270" stroke="#4fc3f7" stroke-width="1"/>
+  <line x1="702" y1="149" x2="485" y2="270" stroke="#4fc3f7" stroke-width="1"/>
+  <line x1="207" y1="149" x2="595" y2="270" stroke="#4fc3f7" stroke-width="1"/>
+  <line x1="757" y1="149" x2="595" y2="270" stroke="#4fc3f7" stroke-width="1"/>
+
+  <text x="450" y="345" text-anchor="middle" fill="#9fb0c3" font-size="12">All NIC0s (rail 0) land on the same leaf switch across every server; same for rail 1, rail 2, etc.</text>
+  <text x="450" y="365" text-anchor="middle" fill="#9fb0c3" font-size="12">NCCL keeps most collective traffic inside a single rail — spine crossing only for the residual traffic.</text>
+</svg>
+
+<h2>Key Terms Glossary</h2>
+<div class="grid2">
+<div class="card">
+<h3>Leaf / Spine</h3>
+<p><strong>Leaf</strong> switches connect directly to servers/nodes. <strong>Spine</strong> switches connect leaves to each other, providing the aggregation layer. Larger builds add a <strong>core</strong> or <strong>super-spine</strong> tier above the spine.</p>
+</div>
+<div class="card">
+<h3>Oversubscription Ratio</h3>
+<p>The ratio of downstream (node-facing) bandwidth on a switch to its upstream (uplink) bandwidth. A 1:1 ("non-blocking") ratio means every node could theoretically use full bandwidth simultaneously; a 3:1 ratio means only a third of that is guaranteed under worst-case, all-to-all traffic — a common cost/performance trade-off outside the GPU rails themselves.</p>
+</div>
+<div class="card">
+<h3>Subnet Manager</h3>
+<p>The control-plane brain of an InfiniBand fabric — discovers topology, computes routing tables, manages partitions. Runs as OpenSM (open source) or NVIDIA UFM (commercial, adds monitoring/AR/SHARP/SHIELD). Every IB fabric needs exactly one active instance.</p>
+</div>
+<div class="card">
+<h3>Rail</h3>
+<p>The dedicated NIC-to-switch path assigned to one GPU position across all servers in the cluster (e.g., "rail 0" = every server's GPU-0 NIC). Rail-aligned wiring lets communication libraries like NCCL keep the heaviest traffic local to a single leaf switch.</p>
+</div>
+</div>
+
+<h2>Worked Example: Sizing a Fat-Tree for a 128-GPU Cluster</h2>
+<div class="card">
+<p>Assume a typical build: 8-GPU servers, one 400 Gbps NIC per GPU (one rail each), so <strong>128 GPUs ÷ 8 GPUs/server = 16 servers</strong>, and <strong>128 total 400G rail ports</strong> to connect (8 rails × 16 servers).</p>
+<p><strong>Step 1 — pick a leaf switch.</strong> A 64-port 400 Gbps leaf switch (like NVIDIA's Quantum-2 QM9700 class) can be split, e.g., 32 ports down to servers and 32 ports up to spines, for a 1:1 (non-blocking) leaf-to-spine ratio.</p>
+<p><strong>Step 2 — one leaf per rail.</strong> In a fully rail-optimized design, you'd typically dedicate one leaf switch per rail number. With 8 rails, that's 8 leaf switches, each taking one NIC from all 16 servers (16 down-links used out of the switch's capacity) — comfortably inside a 32-port leaf, leaving headroom to scale node count later.</p>
+<p><strong>Step 3 — spine sizing.</strong> To keep the fabric non-blocking, the total uplink bandwidth from each leaf must match its total downlink (node-facing) bandwidth. With 16 servers × 400 Gbps = 6.4 Tbps of downlink capacity per leaf/rail, you need an equivalent 6.4 Tbps of uplink capacity split across spine switches — e.g., 16 × 400 Gbps uplinks per leaf feeding into a set of spine switches sized to match.</p>
+<p><strong>Step 4 — result.</strong> A 128-GPU cluster this size comfortably fits in a single-tier leaf-plus-spine (2-tier) fat-tree with 8 rail-dedicated leaves and a handful of spine switches — no third (core) tier needed. Clusters typically only need a third tier once they scale into the thousands of GPUs, where a single spine layer can no longer provide enough radix (port count) to stay non-blocking.</p>
+</div>
+
+<div class="callout tip">
+<div class="label">Takeaway</div>
+Sizing a fabric is fundamentally a radix (port-count) and oversubscription-ratio exercise: count how many rail ports you have, pick a leaf switch radix, decide how much oversubscription (if any) you're willing to tolerate outside the GPU rails, and let that determine how many spine switches and tiers you need.
+</div>
+
+<h2>Further Reading</h2>
+<ul>
+<li><a href="https://www.nvidia.com/en-us/networking/infiniband-switching/">NVIDIA Quantum InfiniBand Switches for AI and HPC Networks</a></li>
+<li><a href="https://networking-docs.nvidia.com/ufmsdnappswum/41815/adaptive-routing">NVIDIA UFM-SDN Appliance User Manual — Adaptive Routing</a></li>
+<li><a href="https://www.fibermall.com/blog/infiniband-subnet-manager-explained.htm">InfiniBand Subnet Manager: OpenSM, Switch SM & UFM — FiberMall</a></li>
+<li><a href="https://docs.nvidia.com/networking/display/kubernetes2640/spectrum-x/spectrum-x.html">NVIDIA Spectrum-X Ethernet Networking Platform — NVIDIA Docs</a></li>
+<li><a href="https://www.spheron.network/blog/gpu-networking-infiniband-roce-spectrum-x-guide/">GPU Networking for AI Clusters: InfiniBand vs RoCE vs Spectrum-X Decision Guide</a></li>
+<li><a href="https://docs.nvidia.com/cuda/gpudirect-rdma/">GPUDirect RDMA — Official NVIDIA CUDA Documentation</a></li>
+<li><a href="https://developer.nvidia.com/gpudirect">NVIDIA GPUDirect — Developer Overview</a></li>
+<li><a href="https://docs.nvidia.com/enterprise-reference-architectures/nvl72-ai-factory/latest/networking-physical-topologies.html">NVIDIA NVL72 AI Factory — Networking Physical Topologies</a></li>
+<li><a href="https://introl.com/blog/gpu-cluster-network-topology-fat-tree-dragonfly-rail-optimized-2025">GPU Cluster Network Topology Design: Fat-Tree, Dragonfly, Rail-Optimized</a></li>
+<li><a href="https://developer.nvidia.com/blog/doubling-all2all-performance-with-nvidia-collective-communication-library-2-12/">Doubling all2all Performance with NCCL 2.12 — NVIDIA Technical Blog</a></li>
+</ul>
+
+<div class="section-nav"><a href="01-compute-hardware.html">← Compute & Hardware</a><a href="03-storage.html">Next: Storage →</a></div>
+</main></div>
+<footer><div class="wrap">Part of the HPC Cluster Build Guide.</div></footer>
+</body>
+</html>

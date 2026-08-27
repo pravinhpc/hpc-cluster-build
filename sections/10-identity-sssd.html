@@ -1,0 +1,291 @@
+<!DOCTYPE html>
+<html data-theme="dark" lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>10 — Identity &amp; Access: Integrating SSSD with Your Cluster | HPC Cluster Build Guide</title>
+<link rel="stylesheet" href="../assets/css/style.css">
+</head>
+<body>
+<header class="top">
+  <div class="wrap">
+    <a href="../index.html">HPC Cluster Build Guide</a>
+    <span class="badge">Public Edition</span>
+  </div>
+</header>
+
+<div class="wrap">
+  <nav class="crumbs"><a href="09-identity-ldap.html">← LDAP Integration</a></nav>
+
+  <main>
+    <h1>10 — Identity &amp; Access: Integrating SSSD with Your Cluster</h1>
+    <p class="lede">Your LDAP directory (or Active Directory / FreeIPA) is the source of truth for who your users are. But you don't want every one of your 2,000 compute nodes talking directly to that directory every time someone runs <code>ls -l</code> or <code>ssh</code>. SSSD is the local buffer that makes identity lookups fast, resilient, and directory-friendly at cluster scale.</p>
+
+    <h2>WHAT — What Is SSSD?</h2>
+    <div class="card">
+      <p><strong>SSSD (System Security Services Daemon)</strong> is a local system daemon that sits between the Linux operating system and one or more remote identity/authentication backends — LDAP, Active Directory, FreeIPA, or Kerberos. It is not itself a directory service; it is a <em>broker and cache</em>. Applications never talk to LDAP directly. Instead, the standard OS lookup paths — NSS (Name Service Switch, used by <code>getent</code>, <code>id</code>, <code>ls -l</code> to resolve names and groups) and PAM (Pluggable Authentication Modules, used by <code>login</code>, <code>sshd</code>, <code>sudo</code> to authenticate) — talk to SSSD over a local Unix socket, and SSSD talks to the directory on their behalf.</p>
+      <p>This is a deliberate architectural change from the older approach of <code>pam_ldap</code> and <code>nss_ldap</code> (or <code>nss-pam-ldapd</code>), which wired PAM and NSS directly into the LDAP protocol with no caching layer in between. Every lookup and every login was a live network round trip to the directory server. If the LDAP server was slow, unreachable, or overloaded, every single login attempt on every node failed immediately — there was no fallback.</p>
+      <table>
+        <tr><th></th><th>pam_ldap / nss_ldap</th><th>SSSD</th></tr>
+        <tr><td>Caching</td><td>None — every call hits LDAP</td><td>Local on-disk cache (LDB database)</td></tr>
+        <tr><td>Offline behavior</td><td>Total auth failure if directory unreachable</td><td>Serves cached identity/credentials for a configurable window</td></tr>
+        <tr><td>Kerberos ticket handling</td><td>Manual / separate pam_krb5</td><td>Built-in, integrated ticket management</td></tr>
+        <tr><td>Multiple backends (LDAP + AD + local)</td><td>Awkward, stacked PAM modules</td><td>Native multi-domain support</td></tr>
+        <tr><td>Config surface</td><td>Spread across nsswitch.conf, ldap.conf, PAM stack</td><td>Centralized in <code>/etc/sssd/sssd.conf</code></td></tr>
+      </table>
+    </div>
+
+    <svg class="diagram" viewBox="0 0 900 400" role="img" aria-label="SSSD as a broker between NSS/PAM and identity backends, with a local cache">
+      <text x="450" y="30" text-anchor="middle" fill="#e8edf4" font-size="18" font-weight="700">SSSD as Broker Between the OS and the Directory</text>
+
+      <rect x="30" y="70" width="220" height="90" rx="10" fill="#1a2437" stroke="#25324a"/>
+      <text x="140" y="100" text-anchor="middle" fill="#e8edf4" font-size="14" font-weight="700">Applications</text>
+      <text x="140" y="122" text-anchor="middle" fill="#9fb0c3" font-size="12">login, sshd, sudo,</text>
+      <text x="140" y="140" text-anchor="middle" fill="#9fb0c3" font-size="12">ls -l, id, getent</text>
+
+      <rect x="30" y="190" width="220" height="70" rx="10" fill="#141c2b" stroke="#4fc3f7"/>
+      <text x="140" y="217" text-anchor="middle" fill="#4fc3f7" font-size="13" font-weight="700">PAM stack</text>
+      <text x="140" y="237" text-anchor="middle" fill="#9fb0c3" font-size="12">/etc/pam.d/*  (pam_sss.so)</text>
+
+      <rect x="30" y="280" width="220" height="70" rx="10" fill="#141c2b" stroke="#4fc3f7"/>
+      <text x="140" y="307" text-anchor="middle" fill="#4fc3f7" font-size="13" font-weight="700">NSS switch</text>
+      <text x="140" y="327" text-anchor="middle" fill="#9fb0c3" font-size="12">/etc/nsswitch.conf (sss)</text>
+
+      <line x1="250" y1="225" x2="330" y2="225" stroke="#76b900" stroke-width="2" marker-end="url(#arrow10)"/>
+      <line x1="250" y1="315" x2="330" y2="315" stroke="#76b900" stroke-width="2" marker-end="url(#arrow10)"/>
+
+      <rect x="330" y="140" width="260" height="220" rx="12" fill="#141c2b" stroke="#76b900" stroke-width="2"/>
+      <text x="460" y="168" text-anchor="middle" fill="#76b900" font-size="15" font-weight="700">SSSD daemon</text>
+      <text x="460" y="186" text-anchor="middle" fill="#9fb0c3" font-size="11">(runs on every node)</text>
+
+      <rect x="350" y="200" width="220" height="60" rx="8" fill="#0d1420" stroke="#25324a"/>
+      <text x="460" y="225" text-anchor="middle" fill="#e8edf4" font-size="12" font-weight="700">Local Cache (LDB)</text>
+      <text x="460" y="243" text-anchor="middle" fill="#9fb0c3" font-size="11">identities + password hashes</text>
+
+      <rect x="350" y="275" width="220" height="60" rx="8" fill="#0d1420" stroke="#25324a"/>
+      <text x="460" y="300" text-anchor="middle" fill="#e8edf4" font-size="12" font-weight="700">Kerberos Ticket Manager</text>
+      <text x="460" y="318" text-anchor="middle" fill="#9fb0c3" font-size="11">renews TGTs automatically</text>
+
+      <line x1="590" y1="225" x2="670" y2="225" stroke="#4fc3f7" stroke-width="2" marker-end="url(#arrow10)"/>
+
+      <rect x="670" y="70" width="200" height="290" rx="10" fill="#1a2437" stroke="#25324a"/>
+      <text x="770" y="100" text-anchor="middle" fill="#e8edf4" font-size="14" font-weight="700">Identity Backend</text>
+      <text x="770" y="140" text-anchor="middle" fill="#9fb0c3" font-size="12">LDAP directory</text>
+      <text x="770" y="170" text-anchor="middle" fill="#9fb0c3" font-size="12">Active Directory</text>
+      <text x="770" y="200" text-anchor="middle" fill="#9fb0c3" font-size="12">FreeIPA</text>
+      <text x="770" y="230" text-anchor="middle" fill="#9fb0c3" font-size="12">Kerberos KDC</text>
+      <text x="770" y="270" text-anchor="middle" fill="#ffb74d" font-size="11">(see Section 09 —</text>
+      <text x="770" y="288" text-anchor="middle" fill="#ffb74d" font-size="11">LDAP Integration)</text>
+
+      <defs>
+        <marker id="arrow10" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
+          <path d="M0,0 L0,6 L9,3 z" fill="#76b900"/>
+        </marker>
+      </defs>
+    </svg>
+
+    <h2>WHY — Why HPC Clusters Use SSSD Instead of Direct LDAP Clients</h2>
+    <div class="card">
+      <ul>
+        <li><strong>Offline caching keeps nodes usable during a directory blip.</strong> If your LDAP/AD server has a network hiccup, a restart, or a maintenance window, nodes running SSSD can still authenticate already-known users and resolve UID/GID mappings from local cache. With direct <code>pam_ldap</code>, that same blip means every login on every node fails instantly — on a cluster with thousands of compute nodes and hundreds of concurrently starting jobs, that is not a hypothetical, it is a recurring operational reality.</li>
+        <li><strong>Reduced load on the directory server.</strong> A large cluster job launch can spawn identity lookups (<code>getpwnam</code>, group resolution) from thousands of node daemons and shell sessions nearly simultaneously. Without a cache, this becomes a thundering-herd problem against your LDAP server. SSSD absorbs the vast majority of these lookups locally and only refreshes on a TTL, converting a burst of thousands of directory queries into a trickle.</li>
+        <li><strong>Built-in Kerberos ticket management.</strong> HPC environments frequently pair identity (LDAP/AD) with Kerberos for SSO and for secure NFS (<code>sec=krb5</code>) or Slurm authentication. SSSD natively renews and manages Kerberos tickets as part of the login flow, instead of requiring a hand-stitched <code>pam_krb5</code> plus <code>pam_ldap</code> combination.</li>
+        <li><strong>Consistent behavior across mixed OS images.</strong> Large clusters are rarely 100% homogeneous — you may have RHEL/Rocky login nodes, Ubuntu compute nodes, and a different distro for storage or management nodes. SSSD ships as a standard, well-maintained package on all of them, giving you one identity-resolution behavior and one config file format to reason about instead of distro-specific LDAP client quirks.</li>
+      </ul>
+    </div>
+    <div class="callout warn">
+      <div class="label">Common Misstep</div>
+      Teams that skip SSSD and hand-roll <code>/etc/ldap.conf</code> + <code>pam_ldap</code> on a golden image usually regret it the first time the directory server needs a maintenance restart during business hours — every node in the cluster loses the ability to start new sessions at once, including the admins trying to SSH in to fix it.
+    </div>
+
+    <h2>WHERE — Where SSSD Sits in the Cluster</h2>
+    <div class="card">
+      <p>SSSD runs as a <strong>local daemon on every single node</strong> — login nodes, compute nodes, storage/NFS gateway nodes, and (if they authenticate interactive users) management nodes. It is not a centralized service; there is no "SSSD server" for the cluster to depend on beyond the identity backend itself. Each node caches identity data independently, in its own local <code>/var/lib/sss/db/</code> database.</p>
+      <p>Logically, SSSD sits directly beneath <code>/etc/nsswitch.conf</code> and the PAM stack, and directly above the network connection to your directory. This is the same LDAP/AD/FreeIPA backend described in <a href="09-identity-ldap.html">Section 09 — LDAP Integration</a> — SSSD does not replace that backend, it is the client-side layer that makes consuming it safe at scale.</p>
+    </div>
+
+    <svg class="diagram" viewBox="0 0 900 400" role="img" aria-label="Thousands of nodes hitting local SSSD cache instead of hammering the LDAP server directly">
+      <text x="450" y="28" text-anchor="middle" fill="#e8edf4" font-size="18" font-weight="700">Auth Flow at Scale: Cache Absorbs the Herd</text>
+
+      <text x="450" y="55" text-anchor="middle" fill="#9fb0c3" font-size="12">Job launch across 2,000 compute nodes — nearly simultaneous identity lookups</text>
+
+      <g>
+        <circle cx="90" cy="110" r="16" fill="#1a2437" stroke="#4fc3f7"/>
+        <circle cx="150" cy="95" r="16" fill="#1a2437" stroke="#4fc3f7"/>
+        <circle cx="210" cy="120" r="16" fill="#1a2437" stroke="#4fc3f7"/>
+        <circle cx="270" cy="90" r="16" fill="#1a2437" stroke="#4fc3f7"/>
+        <circle cx="330" cy="115" r="16" fill="#1a2437" stroke="#4fc3f7"/>
+        <circle cx="120" cy="150" r="16" fill="#1a2437" stroke="#4fc3f7"/>
+        <circle cx="240" cy="150" r="16" fill="#1a2437" stroke="#4fc3f7"/>
+        <text x="210" y="185" text-anchor="middle" fill="#9fb0c3" font-size="12">~2,000 compute nodes, each running local SSSD</text>
+      </g>
+
+      <rect x="60" y="220" width="300" height="60" rx="8" fill="#141c2b" stroke="#76b900" stroke-width="2"/>
+      <text x="210" y="245" text-anchor="middle" fill="#76b900" font-size="13" font-weight="700">Local SSSD cache HIT</text>
+      <text x="210" y="263" text-anchor="middle" fill="#9fb0c3" font-size="11">~99% of lookups resolved with zero network traffic</text>
+
+      <rect x="60" y="310" width="300" height="60" rx="8" fill="#141c2b" stroke="#ffb74d" stroke-width="2"/>
+      <text x="210" y="335" text-anchor="middle" fill="#ffb74d" font-size="13" font-weight="700">Cache MISS / TTL expired</text>
+      <text x="210" y="353" text-anchor="middle" fill="#9fb0c3" font-size="11">small trickle of real queries to directory</text>
+
+      <line x1="410" y1="340" x2="560" y2="240" stroke="#ffb74d" stroke-width="2" marker-end="url(#arrow10b)"/>
+      <text x="470" y="270" fill="#ffb74d" font-size="11" transform="rotate(-33 470 270)">trickle, not a flood</text>
+
+      <rect x="560" y="190" width="250" height="110" rx="10" fill="#1a2437" stroke="#25324a"/>
+      <text x="685" y="220" text-anchor="middle" fill="#e8edf4" font-size="14" font-weight="700">LDAP / AD Directory</text>
+      <text x="685" y="245" text-anchor="middle" fill="#9fb0c3" font-size="12">Handles a manageable rate</text>
+      <text x="685" y="263" text-anchor="middle" fill="#9fb0c3" font-size="12">of refresh queries only</text>
+      <text x="685" y="283" text-anchor="middle" fill="#ff6b6b" font-size="11">(no SSSD = 2,000 nodes hit this directly)</text>
+
+      <defs>
+        <marker id="arrow10b" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
+          <path d="M0,0 L0,6 L9,3 z" fill="#ffb74d"/>
+        </marker>
+      </defs>
+    </svg>
+
+    <h2>WHEN — When to Configure SSSD in the Build Sequence</h2>
+    <div class="card">
+      <p>SSSD configuration belongs in the <strong>base/golden node image build</strong> — the same stage where you set up NTP, DNS resolution, and the NFS/LDAP client packages. It should be baked in and validated <em>before</em> nodes are registered with the provisioning system (BCM, xCAT, Warewulf) and long before they are added to the scheduler's node pool (Slurm/PBS). The reasoning is simple: the scheduler will try to resolve job-submitting users' UIDs/GIDs on every node the moment it's in the pool, and epilog/prolog scripts often depend on working <code>id</code> and <code>getent passwd</code> calls. If SSSD isn't configured and validated first, node registration and job dispatch will fail with confusing, hard-to-trace permission and UID errors.</p>
+      <p>Recommended order: base OS image → network/DNS/NTP → SSSD + LDAP/Kerberos client config (this section) → validate with <code>id</code>/<code>getent</code> → join provisioning system → join scheduler pool.</p>
+    </div>
+    <div class="callout tip">
+      <div class="label">Cache Invalidation Tradeoff</div>
+      There is a real tension between <strong>offboarding urgency</strong> (a terminated employee's access should disappear fast) and <strong>cache TTL</strong> (long TTLs mean fewer directory hits but slower revocation). A common compromise on HPC clusters: keep <code>entry_cache_timeout</code> in the 1–4 hour range for routine operation, and maintain a documented, scripted <code>sss_cache -E</code> + restart procedure (pushed via your config management tool, e.g. Ansible, across all nodes) for emergency offboarding, rather than dropping TTLs cluster-wide just to cover the rare urgent case.
+    </div>
+
+    <h2>HOW — Step-by-Step Configuration</h2>
+
+    <h3>1. Install the packages</h3>
+    <pre><code># RHEL / Rocky / AlmaLinux
+sudo dnf install -y sssd sssd-ldap sssd-krb5 sssd-tools authselect
+
+# Ubuntu / Debian
+sudo apt-get install -y sssd sssd-ldap sssd-krb5 sssd-tools libnss-sss libpam-sss</code></pre>
+
+    <h3>2. Configure <code>/etc/sssd/sssd.conf</code></h3>
+    <p>This file must be owned by <code>root</code> with permissions <code>0600</code> — SSSD will refuse to start otherwise. Below is a realistic configuration for an HPC cluster node pointed at an LDAP directory, with offline caching and TLS enabled:</p>
+    <pre><code>[sssd]
+# Services this instance provides to the OS
+services = nss, pam
+domains = hpccluster.example.org
+config_file_version = 2
+
+[domain/hpccluster.example.org]
+id_provider = ldap
+auth_provider = ldap
+chpass_provider = ldap
+
+ldap_uri = ldap://ldap01.hpccluster.example.org,ldap://ldap02.hpccluster.example.org
+ldap_search_base = dc=hpccluster,dc=example,dc=org
+ldap_id_use_start_tls = true
+ldap_tls_cacert = /etc/pki/tls/certs/hpc-ca-bundle.pem
+
+# --- Offline / caching behavior: the whole point for a large cluster ---
+cache_credentials = true
+entry_cache_timeout = 5400
+entry_cache_user_timeout = 5400
+entry_cache_group_timeout = 14400
+offline_credentials_expiration = 7
+
+# Do NOT enumerate the full directory on a large cluster: it is expensive
+# and unnecessary — resolve users/groups on demand instead.
+enumerate = false
+
+# UID/GID mapping (skip if the directory already publishes POSIX attrs
+# via RFC2307 / RFC2307bis schema, as covered in Section 09)
+ldap_id_mapping = false
+
+min_id = 10000
+max_id = 2000000
+
+# Make home directories consistent across every node
+override_homedir = /home/%u
+default_shell = /bin/bash
+
+[nss]
+filter_groups = root
+filter_users = root
+entry_negative_timeout = 15
+
+[pam]
+offline_credentials_expiration = 7
+pam_verbosity = 2</code></pre>
+
+    <h3>3. Point NSS and PAM at SSSD</h3>
+    <p>On RHEL-family systems this is best done through <code>authselect</code>, which writes consistent, supported NSS and PAM configuration in one step:</p>
+    <pre><code>sudo authselect select sssd with-mkhomedir --force
+sudo systemctl enable --now sssd</code></pre>
+    <p>Manually, this is equivalent to ensuring <code>/etc/nsswitch.conf</code> includes <code>sss</code> in the passwd/group/shadow lines, and the PAM stack (<code>/etc/pam.d/system-auth</code> or <code>/etc/pam.d/common-auth</code> on Debian/Ubuntu) includes <code>pam_sss.so</code>:</p>
+    <pre><code>passwd:     files sss
+group:      files sss
+shadow:     files sss
+netgroup:   files sss</code></pre>
+
+    <h3>4. Bake it into the golden/node image</h3>
+    <p>Once validated on a single test node, fold the package install, <code>sssd.conf</code>, TLS CA bundle, and <code>authselect</code>/PAM changes into your provisioning system's golden image build (BCM software image, xCAT osimage, or Warewulf container). Every node provisioned from that image then boots with identity resolution already working — this must happen before the node is registered with the scheduler.</p>
+
+    <h3>5. Tune cache timeouts for cluster scale</h3>
+    <table>
+      <tr><th>Parameter</th><th>Purpose</th><th>Typical HPC value</th></tr>
+      <tr><td><code>entry_cache_timeout</code></td><td>General TTL for all cached entries</td><td>3600–5400s</td></tr>
+      <tr><td><code>entry_cache_user_timeout</code></td><td>TTL specifically for user entries</td><td>5400s</td></tr>
+      <tr><td><code>entry_cache_group_timeout</code></td><td>TTL for group entries (change less often)</td><td>14400s</td></tr>
+      <tr><td><code>offline_credentials_expiration</code></td><td>Days a cached password remains valid while offline</td><td>7 days</td></tr>
+      <tr><td><code>enumerate</code></td><td>Whether to pre-fetch the entire directory</td><td><code>false</code> (always, on large clusters)</td></tr>
+    </table>
+    <div class="callout warn">
+      <div class="label">Do Not Enable Enumeration</div>
+      <code>enumerate = true</code> tells SSSD to download and cache the entire user/group directory up front. On a directory with tens of thousands of accounts this is slow to complete, adds real load to the LDAP server on every SSSD restart across every node, and is almost never necessary — SSSD resolves individual users/groups on demand just fine.
+    </div>
+
+    <h3>6. Troubleshooting</h3>
+    <pre><code># Check SSSD service state and recent errors
+sudo systemctl status sssd
+sudo journalctl -u sssd -n 100 --no-pager
+
+# Increase log verbosity for the LDAP backend, then check the domain log
+sudo sed -i 's/^debug_level.*/debug_level = 7/' /etc/sssd/sssd.conf
+sudo systemctl restart sssd
+sudo tail -f /var/log/sssd/sssd_hpccluster.example.org.log
+
+# Confirm a specific user resolves via SSSD (bypasses local /etc/passwd)
+getent passwd jdoe
+id jdoe
+
+# Force SSSD to go back to the directory instead of serving stale cache
+sudo sss_cache -E
+sudo systemctl restart sssd
+
+# Clear the cache for one user only, without a full restart
+sudo sss_cache -u jdoe
+
+# Simulate an offline node to test cached-credential login
+sudo systemctl stop network sssd   # in a lab node, NOT production
+sudo systemctl start sssd
+id jdoe   # should still resolve from cache if previously logged in</code></pre>
+    <div class="callout field">
+      <div class="label">Field Note</div>
+      The single most common "SSSD is broken" ticket on a new cluster build is actually a permissions problem: <code>/etc/sssd/sssd.conf</code> not being exactly <code>0600 root:root</code>. SSSD silently refuses to start (or starts with a stale config) if the permissions are wrong — check this first before diving into LDAP connectivity.
+    </div>
+
+    <h2>Further Reading</h2>
+    <ul>
+      <li><a href="https://sssd.io/docs/ad/ad-ldap-provider.html" target="_blank" rel="noopener">sssd.io — LDAP provider with AD domain</a></li>
+      <li><a href="https://docs.redhat.com/en/documentation/red_hat_enterprise_linux/10/html/configuring_authentication_and_authorization_in_rhel/understanding-sssd-and-its-benefits" target="_blank" rel="noopener">Red Hat RHEL 10 — Understanding SSSD and Its Benefits</a></li>
+      <li><a href="https://docs.redhat.com/en/documentation/red_hat_enterprise_linux/8/html/configuring_authentication_and_authorization_in_rhel/configuring-sssd-to-use-ldap-and-require-tls-authentication_configuring-authentication-and-authorization-in-rhel" target="_blank" rel="noopener">Red Hat RHEL 8 — Configuring SSSD to Use LDAP and Require TLS Authentication</a></li>
+      <li><a href="https://docs.redhat.com/en/documentation/red_hat_enterprise_linux/6/html/deployment_guide/sssd-cache-cred" target="_blank" rel="noopener">Red Hat RHEL 6 Deployment Guide — Domain Options: Enabling Offline Authentication</a></li>
+      <li><a href="https://ubuntu.com/server/docs/how-to/sssd/with-ldap/" target="_blank" rel="noopener">Ubuntu Server Documentation — How to Set Up SSSD with LDAP</a></li>
+      <li><a href="https://linux.die.net/man/5/sssd.conf" target="_blank" rel="noopener">sssd.conf(5) man page</a></li>
+    </ul>
+
+    <div class="section-nav">
+      <a href="09-identity-ldap.html">← LDAP Integration</a>
+      <a href="11-onboarding-dls.html">Next: User Onboarding &amp; DLs →</a>
+    </div>
+  </main>
+</div>
+
+<footer><div class="wrap">Part of the HPC Cluster Build Guide.</div></footer>
+</body>
+</html>
